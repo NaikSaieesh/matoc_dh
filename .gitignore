@@ -1,3 +1,4 @@
 .env
 db.py.bak
 test.py
+__pycache__/
