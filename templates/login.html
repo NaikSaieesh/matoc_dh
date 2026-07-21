@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Login</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    background:#0D1117; margin:0; min-height:100vh; font-family:Arial,sans-serif;
+    display:flex; align-items:center; justify-content:center; padding:40px 20px;
+  }
+  .box { background:#161B22; border:1px solid #30363D; border-radius:14px;
+    padding:32px; width:100%; max-width:340px; }
+  h1 { color:#F0F6FC; font-size:20px; margin:0 0 18px; }
+  label { color:#8B949E; font-size:13px; display:block; margin-bottom:6px; }
+  input[type=password] {
+    width:100%; padding:10px 12px; border-radius:8px; border:1px solid #30363D;
+    background:#0D1117; color:#F0F6FC; font-size:14px; margin-bottom:16px;
+  }
+  button {
+    width:100%; padding:10px 12px; border-radius:8px; border:none;
+    background:#1F6FEB; color:#fff; font-weight:700; font-size:14px; cursor:pointer;
+  }
+  button:hover { background:#388BFD; }
+  .error { color:#F85149; font-size:13px; margin-bottom:12px; }
+  a.back { display:block; margin-top:16px; text-align:center; color:#8B949E;
+    text-decoration:none; font-size:13px; }
+  a.back:hover { color:#58A6FF; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>Admin Login</h1>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <form method="POST">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label for="password">Admin password</label>
+      <input type="password" id="password" name="password" autofocus required>
+      <button type="submit">Log In</button>
+    </form>
+    <a class="back" href="{{ next_url }}">&larr; Cancel</a>
+  </div>
+</body>
+</html>

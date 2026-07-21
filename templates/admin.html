@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Panel</title>
+<style>
+  * { box-sizing: border-box; }
+  body { background:#0D1117; margin:0; padding:28px; font-family:Arial,sans-serif; color:#F0F6FC; }
+  a.backlink { color:#8B949E; text-decoration:none; font-size:13px; }
+  a.backlink:hover { color:#58A6FF; }
+  h1 { color:#58A6FF; font-size:24px; margin:10px 0 4px; }
+  p.sub { color:#8B949E; margin:0 0 18px; font-size:13px; }
+
+  .topbar { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; }
+  .topbar .right a { color:#8B949E; text-decoration:none; font-size:13px; margin-left:16px; }
+  .topbar .right a:hover { color:#58A6FF; }
+
+  .banner { padding:10px 14px; border-radius:8px; font-size:13px; margin:16px 0; }
+  .banner.ok { background:#132A1D; border:1px solid #238636; color:#7EE787; }
+  .banner.err { background:#3d1418; border:1px solid #F85149; color:#F85149; }
+
+  .tabs { display:flex; gap:6px; margin:18px 0 20px; border-bottom:1px solid #30363D; }
+  .tabs a {
+    padding:10px 16px; text-decoration:none; color:#8B949E; font-size:13px; font-weight:600;
+    border-bottom:2px solid transparent;
+  }
+  .tabs a.active { color:#58A6FF; border-bottom-color:#58A6FF; }
+  .tabs a:hover { color:#F0F6FC; }
+
+  .panel { background:#161B22; border:1px solid #30363D; border-radius:12px; padding:20px; margin-bottom:20px; }
+  .panel h2 { margin:0 0 14px; font-size:15px; color:#F0F6FC; }
+  .panel p.hint { color:#8B949E; font-size:12px; margin:0 0 14px; }
+
+  table.matoc-table { width:100%; border-collapse:collapse; font-size:13px; }
+  table.matoc-table th { text-align:left; color:#8B949E; padding:8px 10px; border-bottom:1px solid #30363D; font-weight:600; }
+  table.matoc-table td { padding:8px 10px; border-bottom:1px solid #21262D; vertical-align:middle; }
+  table.matoc-table tr:hover td { background:#1C2128; }
+
+  .btn {
+    display:inline-block; text-decoration:none; font-size:12px; font-weight:600; padding:6px 12px;
+    border-radius:7px; border:1px solid #30363D; color:#F0F6FC; background:#0D1117; cursor:pointer;
+    margin-right:6px;
+  }
+  .btn:hover { border-color:#58A6FF; color:#58A6FF; }
+  .btn.primary { background:#1F6FEB; border-color:#1F6FEB; color:#fff; }
+  .btn.primary:hover { background:#388BFD; }
+  .btn.warn { background:#3d2c14; border-color:#D29922; color:#D29922; }
+  .btn.warn:hover { background:#D29922; color:#0D1117; }
+  .btn.danger { background:#3d1418; border-color:#F85149; color:#F85149; }
+  .btn.danger:hover { background:#F85149; color:#fff; }
+
+  form.inline { display:inline; }
+
+  input[type=text] {
+    padding:9px 12px; border-radius:8px; border:1px solid #30363D; background:#0D1117;
+    color:#F0F6FC; font-size:13px;
+  }
+
+  .add-form { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+
+  .editor-layout { display:grid; grid-template-columns: 240px 1fr; gap:18px; align-items:start; }
+  @media (max-width:800px) { .editor-layout { grid-template-columns: 1fr; } }
+  .file-list { max-height:70vh; overflow:auto; }
+  .file-list a {
+    display:block; padding:7px 10px; border-radius:6px; color:#8B949E; text-decoration:none;
+    font-size:12px; font-family:monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .file-list a:hover { background:#1C2128; color:#F0F6FC; }
+  .file-list a.active { background:#0D1117; color:#58A6FF; border:1px solid #30363D; }
+
+  textarea#code {
+    width:100%; height:65vh; background:#0D1117; color:#F0F6FC; border:1px solid #30363D;
+    border-radius:10px; padding:14px; font-family:"SFMono-Regular",Consolas,Menlo,monospace;
+    font-size:13px; line-height:1.5; resize:vertical; tab-size:4;
+  }
+  .editor-toolbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+  .editor-filename { font-family:monospace; color:#58A6FF; font-size:13px; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <a class="backlink" href="{{ url_for('index') }}">&larr; Back to site</a>
+    <div class="right">
+      <span style="color:#238636; font-weight:700; font-size:13px;">&#9679; Admin mode</span>
+      <a href="{{ url_for('logout') }}">Log Out</a>
+    </div>
+  </div>
+
+  <h1>Admin Panel</h1>
+  <p class="sub">Full control of the MATOC database and the site's source code.</p>
+
+  {% if message %}<div class="banner ok">{{ message }}</div>{% endif %}
+  {% if error %}<div class="banner err">{{ error }}</div>{% endif %}
+
+  <div class="tabs">
+    <a href="{{ url_for('admin_dashboard') }}" class="{{ 'active' if active_tab=='overview' else '' }}">MATOCs &amp; Data</a>
+    <a href="{{ url_for('admin_editor') }}" class="{{ 'active' if active_tab=='editor' else '' }}">Code Editor</a>
+  </div>
+
+  {% if active_tab == 'overview' %}
+
+  <div class="panel">
+    <h2>Add a new MATOC</h2>
+    <p class="hint">Creates a brand-new database table for it and adds it to the dashboard grid immediately - no code editing needed.</p>
+    <form class="add-form" method="POST" action="{{ url_for('admin_create_matoc') }}">
+      <input type="text" name="label" placeholder="e.g. NAVFAC SW MACC" required>
+      <button class="btn primary" type="submit">Create MATOC</button>
+    </form>
+  </div>
+
+  <div class="panel">
+    <h2>Existing MATOCs ({{ matocs|length }})</h2>
+    <p class="hint">Truncate empties a table's rows but keeps the MATOC. Delete removes the MATOC and its table permanently - both ask you to confirm.</p>
+    <table class="matoc-table">
+      <thead>
+        <tr><th>MATOC</th><th>Slug</th><th style="text-align:right;">Actions</th></tr>
+      </thead>
+      <tbody>
+        {% for slug, label in matocs.items() %}
+        <tr>
+          <td>{{ label }}</td>
+          <td style="color:#8B949E; font-family:monospace;">{{ slug }}</td>
+          <td style="text-align:right;">
+            <a class="btn" href="{{ url_for('dashboard', slug=slug) }}">View</a>
+            <a class="btn" href="{{ url_for('raw_data', slug=slug) }}">Data</a>
+            <form class="inline" method="POST" action="{{ url_for('admin_truncate_matoc', slug=slug) }}"
+                  onsubmit="return confirm('Delete ALL rows in \'{{ label }}\'? The table itself stays, but every row is gone for good.');">
+              <button class="btn warn" type="submit">Truncate</button>
+            </form>
+            <form class="inline" method="POST" action="{{ url_for('admin_delete_matoc', slug=slug) }}"
+                  onsubmit="return confirm('Permanently delete \'{{ label }}\' and DROP its table? This cannot be undone.');">
+              <button class="btn danger" type="submit">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+        {% if not matocs %}
+        <tr><td colspan="3" style="color:#8B949E;">No MATOCs yet - add one above.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+
+  {% elif active_tab == 'editor' %}
+
+  <div class="panel">
+    <h2>Source code editor</h2>
+    <p class="hint">Editing a <code>.html</code> file reflects on the site the next time that page is loaded.
+      Editing a <code>.py</code> file saves it and the dev server auto-reloads itself in a few seconds
+      (if the site stops responding after a save, you likely introduced a syntax error - a <code>.bak</code>
+      copy of the previous version was saved next to the file).</p>
+    <div class="editor-layout">
+      <div class="file-list">
+        {% for f in files %}
+        <a href="{{ url_for('admin_editor', file=f) }}" class="{{ 'active' if f == selected_file else '' }}">{{ f }}</a>
+        {% endfor %}
+      </div>
+      <div>
+        <div class="editor-toolbar">
+          <span class="editor-filename">{{ selected_file or 'No file selected' }}</span>
+          <button class="btn primary" type="submit" form="editor-form">Save changes</button>
+        </div>
+        <form id="editor-form" method="POST" action="{{ url_for('admin_editor_save') }}">
+          <input type="hidden" name="file" value="{{ selected_file }}">
+          <textarea id="code" name="content" spellcheck="false">{{ file_content }}</textarea>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  {% endif %}
+
+<script>
+// Simple Tab-key-inserts-tab behaviour in the code editor
+const codeArea = document.getElementById('code');
+if (codeArea) {
+  codeArea.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      const start = codeArea.selectionStart, end = codeArea.selectionEnd;
+      codeArea.value = codeArea.value.slice(0, start) + '    ' + codeArea.value.slice(end);
+      codeArea.selectionStart = codeArea.selectionEnd = start + 4;
+    }
+  });
+  // Ctrl/Cmd+S saves
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+      e.preventDefault();
+      document.getElementById('editor-form').submit();
+    }
+  });
+}
+</script>
+</body>
+</html>
