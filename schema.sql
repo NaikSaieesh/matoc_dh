@@ -265,3 +265,9 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL
 );
+
+ALTER TABLE users
+ADD COLUMN is_admin TINYINT(1) NOT NULL DEFAULT 0;
+
+-- then flag your real admin account:
+--UPDATE users SET is_admin = 1 WHERE username = 'admin';

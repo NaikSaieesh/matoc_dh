@@ -278,7 +278,6 @@ COLUMN_MAP = {
     "8(a) or R":                   "eight_a_or_r",
     "Year":                        "year",
     "RFP Number":                  "rfp_number",
-    "Award ID":                    "award_id",
     "Task Order ID":               "award_id",       # alias (newer exports)
     "Title":                       "title",
     "Project Type":                "project_type",
