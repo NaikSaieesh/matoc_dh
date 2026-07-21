@@ -190,6 +190,7 @@ document.querySelectorAll('td[contenteditable="true"]').forEach(td => {
       if (data.ok) {
         td.classList.remove('saved'); void td.offsetWidth; td.classList.add('saved');
         formatCell(td);
+        recalcDerivedColumns(tr, column);
       } else {
         alert("Save failed: " + (data.error || "unknown error"));
         td.textContent = original;
@@ -259,7 +260,70 @@ function formatCell(td) {
       maximumFractionDigits: 2
     });
     // Appends the dollar sign at the end with a trailing space
-    td.textContent = formattedNum + " $";
+    td.textContent = formattedNum;
+  }
+}
+
+// --- Auto-recalculation engine ---
+// Editing any of these three columns re-derives the dependent columns
+// below, updates the cells on screen, and saves each one to the DB -
+// no manual math needed.
+//
+//   Winner Price Difference $  =  Addon Bid - Contract Value
+//   Winner Price Difference %  =  Winner Price Difference $ / Contract Value
+//   Total                      =  Mods + Contract Value
+const DERIVED_SOURCE_COLUMNS = ['Contract Value', 'Addon Bid', 'Mods'];
+
+function findCell(tr, columnLabel) {
+  return tr.querySelector(`td[data-column="${columnLabel}"]`);
+}
+
+function parseNumericCell(td) {
+  if (!td) return 0;
+  const raw = td.textContent.trim().replace(/[$,%\s]/g, "");
+  const num = Number(raw);
+  return isNaN(num) ? 0 : num;
+}
+
+function saveDerivedCell(tr, columnLabel, numValue) {
+  const td = findCell(tr, columnLabel);
+  if (!td) return;
+  td.textContent = numValue.toString();
+  formatCell(td);
+  td.classList.remove('saved'); void td.offsetWidth; td.classList.add('saved');
+
+  const id = tr.dataset.id;
+  fetch("{{ url_for('update_data', slug=slug) }}", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: id, column: columnLabel, value: numValue })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (!data.ok) {
+      alert(`Auto-calc save failed for "${columnLabel}": ` + (data.error || "unknown error"));
+    }
+  })
+  .catch(() => alert(`Auto-calc save failed for "${columnLabel}" - network error.`));
+}
+
+function recalcDerivedColumns(tr, changedColumn) {
+  if (!DERIVED_SOURCE_COLUMNS.includes(changedColumn)) return;
+
+  const contractValue = parseNumericCell(findCell(tr, 'Contract Value'));
+  const addonBid      = parseNumericCell(findCell(tr, 'Addon Bid'));
+  const mods          = parseNumericCell(findCell(tr, 'Mods'));
+
+  const priceDiff    = addonBid - contractValue;
+  const priceDiffPct = contractValue !== 0 ? (priceDiff / contractValue) : 0;
+  const total        = mods + contractValue;
+
+  if (changedColumn === 'Addon Bid' || changedColumn === 'Contract Value') {
+    saveDerivedCell(tr, 'Winner Price Difference $', priceDiff);
+    saveDerivedCell(tr, 'Winner Price Difference %', priceDiffPct);
+  }
+  if (changedColumn === 'Contract Value' || changedColumn === 'Mods') {
+    saveDerivedCell(tr, 'Total', total);
   }
 }
 
@@ -268,4 +332,3 @@ document.querySelectorAll("#data-table tbody td").forEach(formatCell);
 </script>
 </body>
 </html>
-
