@@ -144,7 +144,7 @@ def logout():
 @login_required  # CHANGE 2: Protected main page
 def index():
     """Landing page: pick which MATOC to view."""
-    return render_template("index.html", matocs=get_matocs())
+    return render_template("index.html", matocs=get_matocs(), is_admin=is_admin())
 
 
 @app.route("/dashboard/<slug>")

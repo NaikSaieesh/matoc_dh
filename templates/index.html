@@ -41,10 +41,12 @@
         <div class="desc">View dashboard</div>
       </a>
       {% endfor %}
-      <a class="card admin-card" href="{{ url_for('login', next='/admin') }}">
-    <div class="name">Admin Panel</div>
-    <div class="desc">Full Website Control</div>
-</a>
+      {% if is_admin %}
+      <a class="card admin-card" href="{{ url_for('admin_dashboard') }}">
+        <div class="name">Admin Panel</div>
+        <div class="desc">Full Website Control</div>
+      </a>
+      {% endif %}
     </div>
   </div>
 </body>
