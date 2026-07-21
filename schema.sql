@@ -259,3 +259,9 @@ CREATE TABLE IF NOT EXISTS bids_usag_hi(
 -- FROM bids WHERE matoc = 'FRR';
 -- (repeat for 'NAVFAC ME' -> bids_navfac_me and 'NAVFAC GU' -> bids_navfac_gu)
 -- ------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL
+);

@@ -15,7 +15,7 @@ unchanged rows are left alone, and brand-new folder numbers are inserted.
 import os
 import pandas as pd
 import mysql.connector
-
+from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,7 +37,15 @@ DB_CONFIG = {
 # no restart needed. The dict below is only a one-time seed used the very
 # first time the app runs against a fresh database.
 _SEED_MATOCS = {
-    
+    "frr":       ("FRR",       "bids_frr"),
+    "navfac-me": ("NAVFAC ME", "bids_navfac_me"),
+    "navfac-gu": ("NAVFAC GU", "bids_navfac_gu"),
+    "nih":       ("NIH MACC",  "bids_nih"),
+    "usda-mep":  ("USDA MEP",  "bids_usda_mep"),
+    "usace-dha-areli": ("USACE DHA ARELI", "bids_usace_dha_areli"),
+    "usace-dha-2a":    ("USACE DHA 2A",    "bids_usace_dha_2a"),
+    "micc-ft-drum":    ("MICC FT DRUM",    "bids_micc_ft_drum"),
+    "usag-hi":         ("USAG HI",         "bids_usag_hi"),
 }
 
 _BID_TABLE_DDL = """
@@ -65,7 +73,36 @@ _BID_TABLE_DDL = """
     INDEX idx_project_type (project_type),
     INDEX idx_result (result)
 """
+def get_user_by_username(username):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT * FROM users WHERE username = %s', (username,))
+            return cursor.fetchone()
+    finally:
+        conn.close()
 
+def get_user_by_id(user_id):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))
+            return cursor.fetchone()
+    finally:
+        conn.close()
+
+def create_user(username, password):
+    hashed_password = generate_password_hash(password)
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                'INSERT INTO users (username, password) VALUES (%s, %s)',
+                (username, hashed_password)
+            )
+            conn.commit()
+    finally:
+        conn.close()
 
 def _ensure_registry_table(conn):
     cur = conn.cursor()
@@ -88,6 +125,59 @@ def _ensure_registry_table(conn):
     conn.commit()
     cur.close()
 
+# --------------------------------------------------------------------------
+# User & Auth Helpers (FIXED)
+# --------------------------------------------------------------------------
+
+def get_user_by_username(username):
+    conn = get_connection()  # <-- Changed from get_db_connection()
+    try:
+        # Use dictionary=True so user['password'] works
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute('SELECT * FROM users WHERE username = %s', (username,))
+            return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def get_user_by_id(user_id):
+    conn = get_connection()  # <-- Changed from get_db_connection()
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))
+            return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def create_user(username, password):
+    hashed_password = generate_password_hash(password)
+    conn = get_connection()  # <-- Changed from get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                'INSERT INTO users (username, password) VALUES (%s, %s)',
+                (username, hashed_password)
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def check_login(username, password):
+    conn = get_connection()  # <-- Changed from get_db_connection()
+    try:
+        with conn.cursor(dictionary=True) as cursor:  # <-- Added dictionary=True
+            cursor.execute("SELECT * FROM users WHERE username = %s", (username.strip(),))
+            user = cursor.fetchone()
+
+            print("DEBUG: DB Record =", user)
+
+            if user and check_password_hash(user['password'], password):
+                return user
+            return None
+    finally:
+        conn.close()
 
 def _load_registry() -> dict:
     """Returns {slug: (label, table_name)} straight from the database."""

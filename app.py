@@ -1,52 +1,75 @@
+from functools import wraps
 import io
 import os
-from functools import wraps
 
+from dotenv import load_dotenv
 from flask import (
-    Flask, render_template, abort, Response, request, redirect,
-    url_for, session, send_file, flash
+    Flask,
+    Response,
+    abort,
+    flash,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    url_for,
 )
 import pandas as pd
 
+from charts import (
+    build_contractor_project_chart,
+    build_contractor_year_chart,
+    build_full_dashboard_html,
+)
 from db import (
+    COLUMN_MAP,
+    check_login,
+    create_matoc,
+    delete_matoc,
+    delete_row,
+    get_contractor_dataframe,
+    get_contractors,
+    get_matocs,
     load_matoc_dataframe,
     load_raw_dataframe,
+    truncate_matoc_table,
     update_cell,
     upsert_dataframe,
-    delete_row,
-    get_matocs,
-    COLUMN_MAP,
-    get_contractors,
-    get_contractor_dataframe,
-    create_matoc,
-    truncate_matoc_table,
-    delete_matoc,
 )
-
-from charts import (
-    build_full_dashboard_html,
-    build_contractor_year_chart,
-    build_contractor_project_chart
-)
-
-from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
-# Needed for login sessions. Set a real secret in production via env var.
+
+# Needed for login session cookies. Set a real secret in production via env var.
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
-# Admin password - change this (or set the ADMIN_PASSWORD env var) before
-# putting this anywhere other people can reach.
+# Admin password default fallback
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 
+# --------------------------------------------------------------------------
+# Helper & Decorator Functions
+# --------------------------------------------------------------------------
+
 def is_admin() -> bool:
+    """Check whether the current session has admin privileges."""
     return bool(session.get("is_admin"))
 
 
+def login_required(f):
+    """Ensure user is logged in before accessing the view."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("logged_in"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return decorated
+
+
 def admin_required(view):
+    """Ensure user is authenticated with admin privileges."""
     @wraps(view)
     def wrapped(*args, **kwargs):
         if not is_admin():
@@ -56,36 +79,76 @@ def admin_required(view):
 
 
 def check_slug(slug):
+    """Verify that a MATOC slug exists, else abort with 404."""
     if slug not in get_matocs():
         abort(404, f"Unknown MATOC '{slug}'")
 
 
+def _asterisk_filter_on() -> bool:
+    """Reads the ?asterisk=on/off query param (defaults to ON) and returns
+    whether the Asterisk Bid filter should be applied."""
+    return request.args.get("asterisk", "on").strip().lower() != "off"
+
+
 # --------------------------------------------------------------------------
-# Landing page + main dashboard
+# Auth Routes
+# --------------------------------------------------------------------------
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    # CHANGE 1: If user is ALREADY logged in, redirect them directly to index
+    if session.get("logged_in"):
+        return redirect(url_for("index"))
+
+    next_url = request.args.get("next") or request.form.get("next") or url_for("index")
+    error = None
+
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+
+        # Check DB authentication (MySQL / Database check)
+        user = check_login(username, password) if username else None
+
+        if user:
+            session["logged_in"] = True
+            session["username"] = user["username"]
+            session["user_id"] = user["id"]
+            session["is_admin"] = user.get("is_admin", False)
+            return redirect(next_url)
+
+        # Fallback to direct admin password check
+        elif password == ADMIN_PASSWORD:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["is_admin"] = True
+            return redirect(next_url)
+
+        error = "Invalid credentials. Please try again."
+        flash(error)
+
+    return render_template("login_main.html", error=error, next_url=next_url)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()  # Clears session cookie data
+    return redirect(url_for("login"))
+
+
+# --------------------------------------------------------------------------
+# Landing Page + Main Dashboard (Protected with @login_required)
 # --------------------------------------------------------------------------
 
 @app.route("/")
+@login_required  # CHANGE 2: Protected main page
 def index():
     """Landing page: pick which MATOC to view."""
     return render_template("index.html", matocs=get_matocs())
 
 
-'''@app.route("/dashboard/<slug>")
-def dashboard(slug):
-    check_slug(slug)
-    matoc_label = get_matocs()[slug]
-    df = load_matoc_dataframe(slug)
-    html = build_full_dashboard_html(df, matoc_label, slug=slug, is_admin=is_admin())
-    return Response(html, mimetype="text/html")'''
-
-def _asterisk_filter_on() -> bool:
-    """Reads the ?asterisk=on/off query param (defaults to ON, same as the
-    original always-on behavior) and returns whether the Asterisk Bid
-    filter should be applied."""
-    return request.args.get("asterisk", "on").strip().lower() != "off"
-
-
 @app.route("/dashboard/<slug>")
+@login_required  # CHANGE 2: Protected dashboard
 def dashboard(slug):
     check_slug(slug)
 
@@ -104,16 +167,20 @@ def dashboard(slug):
 
     return Response(html, mimetype="text/html")
 
+
 @app.route("/dashboard/<slug>/download")
+@login_required
 def download_dashboard(slug):
-    """Download the ENTIRE rendered dashboard as one self-contained .html
-    file (charts, KPIs, tables and all - opens straight in a browser)."""
+    """Download the ENTIRE rendered dashboard as one self-contained .html file."""
     check_slug(slug)
     matoc_label = get_matocs()[slug]
     df = load_matoc_dataframe(slug)
     exclude_asterisk_bids = _asterisk_filter_on()
     html = build_full_dashboard_html(
-        df, matoc_label, slug=slug, is_admin=is_admin(),
+        df,
+        matoc_label,
+        slug=slug,
+        is_admin=is_admin(),
         exclude_asterisk_bids=exclude_asterisk_bids,
     )
     buf = io.BytesIO(html.encode("utf-8"))
@@ -122,35 +189,13 @@ def download_dashboard(slug):
 
 
 # --------------------------------------------------------------------------
-# Admin login / logout
-# --------------------------------------------------------------------------
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    next_url = request.args.get("next") or request.form.get("next") or url_for("index")
-    error = None
-    if request.method == "POST":
-        if request.form.get("password") == ADMIN_PASSWORD:
-            session["is_admin"] = True
-            return redirect(next_url)
-        error = "Wrong password."
-    return render_template("login.html", error=error, next_url=next_url)
-
-
-@app.route("/logout")
-def logout():
-    session.pop("is_admin", None)
-    return redirect(request.referrer or url_for("index"))
-
-
-# --------------------------------------------------------------------------
-# Raw data / Excel view + admin editing + Excel import
+# Raw Data / Excel View + Editing + Import/Export
 # --------------------------------------------------------------------------
 
 @app.route("/dashboard/<slug>/data")
+@login_required
 def raw_data(slug):
-    """Shows every row/column for this MATOC in an Excel-like grid.
-    Editing and importing are only available once logged in as admin."""
+    """Shows every row/column for this MATOC in an Excel-like grid."""
     check_slug(slug)
     df = load_raw_dataframe(slug)
     columns = list(COLUMN_MAP.keys())  # Excel-style headers, in order
@@ -167,8 +212,9 @@ def raw_data(slug):
 
 
 @app.route("/dashboard/<slug>/data/export")
+@login_required
 def export_raw_data(slug):
-    """Download the raw table as a real .xlsx file (opens in Excel)."""
+    """Download the raw table as an .xlsx file."""
     check_slug(slug)
     matoc_label = get_matocs()[slug]
     df = load_raw_dataframe(slug).drop(columns=["id"], errors="ignore")
@@ -212,10 +258,7 @@ def delete_data_row(slug, row_id):
 @app.route("/dashboard/<slug>/data/upload", methods=["POST"])
 @admin_required
 def upload_data(slug):
-    """Import/refresh this MATOC's data from an uploaded Excel file.
-    Matched on Folder Number: unchanged rows are skipped, changed rows are
-    replaced in place, and brand-new Folder Numbers are added - so
-    re-uploading a file (even an updated one) never creates duplicates."""
+    """Import/refresh this MATOC's data from an uploaded Excel file."""
     check_slug(slug)
     file = request.files.get("excel_file")
     if not file or file.filename == "":
@@ -225,53 +268,45 @@ def upload_data(slug):
     try:
         df = pd.read_excel(file, sheet_name=sheet)
         stats = upsert_dataframe(slug, df)
-        msg = (f"Import complete - inserted: {stats['inserted']}, "
-               f"updated: {stats['updated']}, unchanged: {stats['unchanged']}, "
-               f"skipped: {stats['skipped']}.")
+        msg = (
+            f"Import complete - inserted: {stats['inserted']}, "
+            f"updated: {stats['updated']}, unchanged: {stats['unchanged']}, "
+            f"skipped: {stats['skipped']}."
+        )
     except Exception as e:
         msg = f"Import failed: {e}"
 
     return redirect(url_for("raw_data", slug=slug, message=msg))
 
-@app.route("/dashboard/<slug>/contractor")
-def contractor_intelligence(slug):
 
+@app.route("/dashboard/<slug>/contractor")
+@login_required
+def contractor_intelligence(slug):
     check_slug(slug)
 
     contractors = get_contractors(slug)
-
-    if len(contractors) == 0:
+    if not contractors:
         return "No contractor data found."
 
     selected = request.args.get("contractor")
-
     if not selected:
         selected = contractors[0]
 
     df = get_contractor_dataframe(slug, selected)
 
     total_projects = len(df)
-
     total_wins = (df["Result"] == "WON").sum()
-
     total_value = df["Contract Value"].sum()
-
     win_rate = round((total_wins / total_projects) * 100, 1) if total_projects else 0
 
     stats = {
-
         "total_projects": total_projects,
-
         "total_wins": total_wins,
-
         "total_value": total_value,
-
-        "win_rate": win_rate
-
+        "win_rate": win_rate,
     }
 
     yearly_chart = build_contractor_year_chart(df)
-
     project_chart = build_contractor_project_chart(df)
 
     recent = (
@@ -281,23 +316,20 @@ def contractor_intelligence(slug):
     )
 
     return render_template(
-
         "contractor_intelligence.html",
-
         slug=slug,
-
         contractors=contractors,
-
         selected=selected,
-
         stats=stats,
-
         yearly_chart=yearly_chart,
-
         project_chart=project_chart,
-
-        recent=recent
+        recent=recent,
     )
+
+
+# --------------------------------------------------------------------------
+# Admin Operations
+# --------------------------------------------------------------------------
 
 @app.route("/admin")
 @admin_required
@@ -318,7 +350,9 @@ def admin_create_matoc():
     label = request.form.get("label", "")
     try:
         slug = create_matoc(label)
-        return redirect(url_for("admin_dashboard", message=f"MATOC '{label}' created (slug: {slug})."))
+        return redirect(
+            url_for("admin_dashboard", message=f"MATOC '{label}' created (slug: {slug}).")
+        )
     except Exception as e:
         return redirect(url_for("admin_dashboard", error=f"Could not create MATOC: {e}"))
 
@@ -330,7 +364,9 @@ def admin_truncate_matoc(slug):
     label = get_matocs()[slug]
     try:
         truncate_matoc_table(slug)
-        return redirect(url_for("admin_dashboard", message=f"All rows in '{label}' were deleted (table kept)."))
+        return redirect(
+            url_for("admin_dashboard", message=f"All rows in '{label}' were deleted (table kept).")
+        )
     except Exception as e:
         return redirect(url_for("admin_dashboard", error=f"Could not truncate '{label}': {e}"))
 
@@ -342,17 +378,15 @@ def admin_delete_matoc(slug):
     label = get_matocs()[slug]
     try:
         delete_matoc(slug)
-        return redirect(url_for("admin_dashboard", message=f"MATOC '{label}' and its table were deleted."))
+        return redirect(
+            url_for("admin_dashboard", message=f"MATOC '{label}' and its table were deleted.")
+        )
     except Exception as e:
         return redirect(url_for("admin_dashboard", error=f"Could not delete '{label}': {e}"))
 
 
 # --------------------------------------------------------------------------
-# Admin code editor - lets you edit the site's own source files from the
-# browser. Anyone with the admin password can run arbitrary code on this
-# server through this feature, so keep ADMIN_PASSWORD strong and never
-# expose this app to the open internet without extra protection (VPN,
-# firewall, reverse-proxy auth, HTTPS, etc).
+# Admin Code Editor
 # --------------------------------------------------------------------------
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -361,8 +395,7 @@ EXCLUDED_DIRS = {"__pycache__", ".git", "venv", ".venv", "node_modules"}
 
 
 def _safe_project_path(rel_path):
-    """Resolves rel_path under PROJECT_ROOT and blocks any path-traversal
-    attempt (e.g. '../../etc/passwd'). Raises ValueError if unsafe."""
+    """Resolves rel_path under PROJECT_ROOT and blocks path-traversal attempts."""
     candidate = os.path.abspath(os.path.join(PROJECT_ROOT, rel_path))
     if not (candidate == PROJECT_ROOT or candidate.startswith(PROJECT_ROOT + os.sep)):
         raise ValueError("Path is outside the project folder.")
@@ -418,7 +451,6 @@ def admin_editor_save():
     content = request.form.get("content", "")
     try:
         path = _safe_project_path(rel_path)
-        # Keep a one-deep .bak backup so a bad edit is always recoverable.
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 original = f.read()
@@ -428,15 +460,19 @@ def admin_editor_save():
             f.write(content)
         note = ""
         if rel_path.endswith(".py"):
-            note = (" Python file saved - the dev server will auto-reload in a few seconds "
-                    "(if it doesn't come back, there's likely a syntax error - check the "
-                    f"terminal, or restore {rel_path}.bak).")
-        return redirect(url_for("admin_editor", file=rel_path, message=f"Saved {rel_path}." + note))
+            note = (
+                " Python file saved - the dev server will auto-reload in a few seconds."
+            )
+        return redirect(
+            url_for("admin_editor", file=rel_path, message=f"Saved {rel_path}." + note)
+        )
     except Exception as e:
         return redirect(url_for("admin_editor", file=rel_path, error=f"Save failed: {e}"))
 
 
-import os
+# --------------------------------------------------------------------------
+# Application Entry Point
+# --------------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
