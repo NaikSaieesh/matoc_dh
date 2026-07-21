@@ -37,15 +37,7 @@ DB_CONFIG = {
 # no restart needed. The dict below is only a one-time seed used the very
 # first time the app runs against a fresh database.
 _SEED_MATOCS = {
-    "frr":       ("FRR",       "bids_frr"),
-    "navfac-me": ("NAVFAC ME", "bids_navfac_me"),
-    "navfac-gu": ("NAVFAC GU", "bids_navfac_gu"),
-    "nih":       ("NIH MACC",  "bids_nih"),
-    "usda-mep":  ("USDA MEP",  "bids_usda_mep"),
-    "usace-dha-areli": ("USACE DHA ARELI", "bids_usace_dha_areli"),
-    "usace-dha-2a":    ("USACE DHA 2A",    "bids_usace_dha_2a"),
-    "micc-ft-drum":    ("MICC FT DRUM",    "bids_micc_ft_drum"),
-    "usag-hi":         ("USAG HI",         "bids_usag_hi"),
+    
 }
 
 _BID_TABLE_DDL = """
