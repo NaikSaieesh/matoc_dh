@@ -142,7 +142,7 @@ def check_login(username, password):
             cursor.execute("SELECT * FROM users WHERE username = %s", (username.strip(),))
             user = cursor.fetchone()
 
-            print("DEBUG: DB Record =", user)
+            #print("DEBUG: DB Record =", user)
 
             if user and check_password_hash(user['password'], password):
                 return user
