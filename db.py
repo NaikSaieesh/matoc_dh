@@ -13,10 +13,13 @@ duplicate rows: existing folder numbers get their values updated in place,
 unchanged rows are left alone, and brand-new folder numbers are inserted.
 """
 import os
+import uuid
+from datetime import datetime, timedelta
 import pandas as pd
 import mysql.connector
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
+from flask import session, request
 
 load_dotenv()
 
@@ -31,21 +34,16 @@ DB_CONFIG = {
 # --------------------------------------------------------------------------
 # MATOC registry
 # --------------------------------------------------------------------------
-# MATOCs used to be a hardcoded Python dict you had to hand-edit. They now
-# live in a `matoc_config` table in the database instead, so the Admin Panel
-# can add/rename/remove a MATOC (and its data table) with no code changes and
-# no restart needed. The dict below is only a one-time seed used the very
-# first time the app runs against a fresh database.
 _SEED_MATOCS = {
-    "frr":       ("FRR",       "bids_frr"),
-    "navfac-me": ("NAVFAC ME", "bids_navfac_me"),
-    "navfac-gu": ("NAVFAC GU", "bids_navfac_gu"),
-    "nih":       ("NIH MACC",  "bids_nih"),
-    "usda-mep":  ("USDA MEP",  "bids_usda_mep"),
-    "usace-dha-areli": ("USACE DHA ARELI", "bids_usace_dha_areli"),
-    "usace-dha-2a":    ("USACE DHA 2A",    "bids_usace_dha_2a"),
-    "micc-ft-drum":    ("MICC FT DRUM",    "bids_micc_ft_drum"),
-    "usag-hi":         ("USAG HI",         "bids_usag_hi"),
+    "frr":            ("FRR",           "bids_frr"),
+    "navfac-me":      ("NAVFAC ME",     "bids_navfac_me"),
+    "navfac-gu":      ("NAVFAC GU",     "bids_navfac_gu"),
+    "nih":            ("NIH MACC",      "bids_nih"),
+    "usda-mep":       ("USDA MEP",      "bids_usda_mep"),
+    "usace-dha-areli":("USACE DHA ARELI", "bids_usace_dha_areli"),
+    "usace-dha-2a":   ("USACE DHA 2A",    "bids_usace_dha_2a"),
+    "micc-ft-drum":   ("MICC FT DRUM",    "bids_micc_ft_drum"),
+    "usag-hi":        ("USAG HI",         "bids_usag_hi"),
 }
 
 _BID_TABLE_DDL = """
@@ -60,49 +58,19 @@ _BID_TABLE_DDL = """
     awardee                     VARCHAR(255),
     contract_value              DECIMAL(15,2) DEFAULT 0,
     addon_bid                   DECIMAL(15,2) DEFAULT 0,
-    asterisk_bid VARCHAR(10),
+    asterisk_bid                VARCHAR(10),
     winner_price_diff_usd       DECIMAL(15,2) DEFAULT 0,
     winner_price_diff_pct       DECIMAL(10,4) DEFAULT 0,
     number_of_offers_received   INT DEFAULT 0,
     result                      VARCHAR(20),
     mods                        DECIMAL(15,2) DEFAULT 0,
     total                       DECIMAL(15,2) DEFAULT 0,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NULL,
+    created_at                  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at                  TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uniq_folder_number (folder_number),
     INDEX idx_project_type (project_type),
     INDEX idx_result (result)
 """
-def get_user_by_username(username):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute('SELECT * FROM users WHERE username = %s', (username,))
-            return cursor.fetchone()
-    finally:
-        conn.close()
-
-def get_user_by_id(user_id):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))
-            return cursor.fetchone()
-    finally:
-        conn.close()
-
-def create_user(username, password):
-    hashed_password = generate_password_hash(password)
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                'INSERT INTO users (username, password) VALUES (%s, %s)',
-                (username, hashed_password)
-            )
-            conn.commit()
-    finally:
-        conn.close()
 
 def _ensure_registry_table(conn):
     cur = conn.cursor()
@@ -126,13 +94,16 @@ def _ensure_registry_table(conn):
     cur.close()
 
 # --------------------------------------------------------------------------
-# User & Auth Helpers (FIXED)
+# User & Auth Helpers
 # --------------------------------------------------------------------------
 
+def get_connection():
+    return mysql.connector.connect(**DB_CONFIG)
+
+
 def get_user_by_username(username):
-    conn = get_connection()  # <-- Changed from get_db_connection()
+    conn = get_connection()
     try:
-        # Use dictionary=True so user['password'] works
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute('SELECT * FROM users WHERE username = %s', (username,))
             return cursor.fetchone()
@@ -141,7 +112,7 @@ def get_user_by_username(username):
 
 
 def get_user_by_id(user_id):
-    conn = get_connection()  # <-- Changed from get_db_connection()
+    conn = get_connection()
     try:
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))
@@ -152,7 +123,7 @@ def get_user_by_id(user_id):
 
 def create_user(username, password):
     hashed_password = generate_password_hash(password)
-    conn = get_connection()  # <-- Changed from get_db_connection()
+    conn = get_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -165,9 +136,9 @@ def create_user(username, password):
 
 
 def check_login(username, password):
-    conn = get_connection()  # <-- Changed from get_db_connection()
+    conn = get_connection()
     try:
-        with conn.cursor(dictionary=True) as cursor:  # <-- Added dictionary=True
+        with conn.cursor(dictionary=True) as cursor:
             cursor.execute("SELECT * FROM users WHERE username = %s", (username.strip(),))
             user = cursor.fetchone()
 
@@ -178,6 +149,52 @@ def check_login(username, password):
             return None
     finally:
         conn.close()
+
+
+def create_user_session(user_id, session_id, expires_at, ip_address, user_agent):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO user_sessions
+        (user_id, session_id, login_time, last_activity,
+         expires_at, ip_address, user_agent, is_active)
+        VALUES (%s,%s,NOW(),NOW(),%s,%s,%s,1)
+    """,(
+        user_id,
+        session_id,
+        expires_at,
+        ip_address,
+        user_agent
+    ))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def handle_user_session(user):
+    """
+    Sets up Flask session keys and persists session record to DB.
+    Call this inside your login route after successful verification.
+    """
+    session.permanent = True
+    session["user_id"] = user["id"]
+    session["username"] = user["username"]
+
+    session_uuid = str(uuid.uuid4())
+    session["session_id"] = session_uuid
+
+    expires_at = datetime.now() + timedelta(minutes=45)
+
+    create_user_session(
+        user_id=user["id"],
+        session_id=session_uuid,
+        expires_at=expires_at,
+        ip_address=request.remote_addr,
+        user_agent=request.headers.get("User-Agent")
+    )
+
 
 def _load_registry() -> dict:
     """Returns {slug: (label, table_name)} straight from the database."""
@@ -210,8 +227,7 @@ def _slugify(label: str) -> str:
 
 def create_matoc(label: str) -> str:
     """Add a brand-new MATOC: makes a slug + table name from the label,
-    creates the physical table, registers it, and returns the new slug.
-    This is what lets the Admin Panel add a MATOC with no code edits."""
+    creates the physical table, registers it, and returns the new slug."""
     label = (label or "").strip()
     if not label:
         raise ValueError("Label is required.")
@@ -240,8 +256,7 @@ def create_matoc(label: str) -> str:
 
 
 def truncate_matoc_table(slug: str):
-    """Wipes every row for one MATOC but keeps the table and the MATOC
-    itself (it stays on the dashboard, just empty)."""
+    """Wipes every row for one MATOC but keeps the table and registry entry."""
     table = table_for(slug)
     conn = get_connection()
     cur = conn.cursor()
@@ -252,8 +267,7 @@ def truncate_matoc_table(slug: str):
 
 
 def delete_matoc(slug: str):
-    """Removes a MATOC entirely: drops its physical table AND removes it
-    from the dashboard/registry. This cannot be undone."""
+    """Removes a MATOC entirely: drops physical table AND removes from config."""
     registry = _load_registry()
     if slug not in registry:
         raise KeyError(f"Unknown MATOC slug '{slug}'")
@@ -266,34 +280,27 @@ def delete_matoc(slug: str):
     cur.close()
     conn.close()
 
-# Excel/UI column name -> DB column name (order matters for the raw data view).
-# Some newer exports use different header text for the same underlying data
-# (e.g. "Task Order ID" instead of "Award ID", "Asterix" instead of
-# "Asterisk Bid"). Both spellings are listed as aliases mapping to the same
-# DB column, so either header name is accepted on import - whichever one
-# appears in a given file's header row is the one that gets used, and
-# nothing is silently dropped just because a file renamed a column.
+
 COLUMN_MAP = {
     "Folder Number":               "folder_number",
-    "8(a) or R":                   "eight_a_or_r",
-    "Year":                        "year",
+    "8(a) or R":                  "eight_a_or_r",
+    "Year":                       "year",
     "RFP Number":                  "rfp_number",
-    "Task Order ID":               "award_id",       # alias (newer exports)
-    "Title":                       "title",
-    "Project Type":                "project_type",
-    "Awardee":                     "awardee",
+    "Task Order ID":              "award_id",
+    "Title":                      "title",
+    "Project Type":               "project_type",
+    "Awardee":                    "awardee",
     "Contract Value":              "contract_value",
-    "Addon Bid":                   "addon_bid",
-    "Asterisk Bid":                "asterisk_bid",
-    "Winner Price Difference $":   "winner_price_diff_usd",
-    "Winner Price Difference %":   "winner_price_diff_pct",
-    "Number of Offers Received":   "number_of_offers_received",
-    "Result":                      "result",
-    "Mods":                        "mods",
-    "Total":                       "total",
+    "Addon Bid":                  "addon_bid",
+    "Asterisk Bid":               "asterisk_bid",
+    "Winner Price Difference $":  "winner_price_diff_usd",
+    "Winner Price Difference %":  "winner_price_diff_pct",
+    "Number of Offers Received":  "number_of_offers_received",
+    "Result":                     "result",
+    "Mods":                       "mods",
+    "Total":                      "total",
 }
-# Last alias listed per DB column wins as the display label (so newer header
-# names show up in the raw-data view / admin edit grid).
+
 DB_TO_LABEL = {v: k for k, v in COLUMN_MAP.items()}
 
 NUMERIC_COLS = [
@@ -301,7 +308,7 @@ NUMERIC_COLS = [
     "winner_price_diff_pct", "number_of_offers_received", "mods", "total",
 ]
 
-KEY_COL = "folder_number"  # Excel column 1 - the de-dup / update key
+KEY_COL = "folder_number"
 
 
 def table_for(slug: str) -> str:
@@ -311,14 +318,7 @@ def table_for(slug: str) -> str:
     return tables[slug]
 
 
-def get_connection():
-    return mysql.connector.connect(**DB_CONFIG)
-
-
 def load_matoc_dataframe(matoc_slug: str) -> pd.DataFrame:
-    """Fetch all bid rows for one MATOC's table and return as a pandas
-    DataFrame, with columns renamed to match the names the chart-building
-    code expects."""
     table = table_for(matoc_slug)
     conn = get_connection()
     query = f"""
@@ -343,9 +343,6 @@ def load_matoc_dataframe(matoc_slug: str) -> pd.DataFrame:
 
 
 def load_raw_dataframe(matoc_slug: str) -> pd.DataFrame:
-    """Fetch every column (plus the internal row `id`) for the 'view raw
-    data / Excel view' page and the admin edit grid, with Excel-style
-    column headers."""
     table = table_for(matoc_slug)
     conn = get_connection()
     unique_cols = list(dict.fromkeys(COLUMN_MAP.values()))
@@ -358,7 +355,6 @@ def load_raw_dataframe(matoc_slug: str) -> pd.DataFrame:
 
 
 def update_cell(matoc_slug: str, row_id: int, column_label: str, value: str):
-    """Admin edit: update a single cell (row_id, Excel column label) in place."""
     table = table_for(matoc_slug)
     if column_label not in COLUMN_MAP:
         raise ValueError(f"Unknown column '{column_label}'")
@@ -384,18 +380,13 @@ def _clean_import_df(df: pd.DataFrame) -> pd.DataFrame:
         .map(lambda x: str(x).strip() if pd.notna(x) else None)
     )
 
-    # remove blank or NaN headers completely
     df = df.loc[:, [c not in [None, "", "nan", "NaN"] for c in df.columns]]
     keep = {src: dst for src, dst in COLUMN_MAP.items() if src in df.columns}
     df = df[list(keep.keys())].rename(columns=keep)
 
-    # remove any unmapped columns that somehow became NaN
     df = df.loc[:, [pd.notna(c) for c in df.columns]]
     df = df.loc[:, [str(c).lower() != "nan" for c in df.columns]]
-    # If a file has more than one header aliasing the same DB column (e.g.
-    # both "Award ID" and "Task Order ID"), keep the first non-empty value
-    # per row and drop the extra duplicate column so nothing downstream sees
-    # two columns with the same name.
+
     if df.columns.duplicated().any():
         deduped = {}
         for col in df.columns.unique():
@@ -416,15 +407,6 @@ def _clean_import_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def upsert_dataframe(matoc_slug: str, df: pd.DataFrame) -> dict:
-    """Import an Excel dataframe into one MATOC's table with no duplicates:
-
-    - Row matched by `Folder Number` (the unique key) that has an identical
-      value in every column -> left alone (counted as 'unchanged').
-    - Row matched by `Folder Number` but with at least one changed value ->
-      that row is updated/replaced in place (counted as 'updated').
-    - `Folder Number` not seen before -> inserted as a new row ('inserted').
-    - Rows with no Folder Number at all are skipped ('skipped').
-    """
     table = table_for(matoc_slug)
     df = _clean_import_df(df)
 
@@ -438,8 +420,6 @@ def upsert_dataframe(matoc_slug: str, df: pd.DataFrame) -> dict:
 
     conn = get_connection()
     cur = conn.cursor()
-    #print("DF COLUMNS:", list(df.columns))
-    #print(df.head())
 
     db_cols = [
         c for c in df.columns
@@ -463,15 +443,9 @@ def upsert_dataframe(matoc_slug: str, df: pd.DataFrame) -> dict:
             stats["skipped"] += 1
             continue
 
-        values = [ None if pd.isna(row_dict[c]) else row_dict[c]for c in all_cols ]
-        #print("IMPORT COLUMNS:", all_cols)
-        #print("SQL:", insert_sql)
-        #print("VALUES:", values)
+        values = [None if pd.isna(row_dict[c]) else row_dict[c] for c in all_cols]
 
         cur.execute(insert_sql, values)
-        # MySQL affected-row semantics for INSERT ... ON DUPLICATE KEY UPDATE:
-        # 1 = new row inserted, 2 = existing row updated with a real change,
-        # 0 = existing row matched but every value was already identical.
         if cur.rowcount == 1:
             stats["inserted"] += 1
         elif cur.rowcount == 2:
@@ -484,14 +458,10 @@ def upsert_dataframe(matoc_slug: str, df: pd.DataFrame) -> dict:
     conn.close()
     return stats
 
+
 def get_contractors(matoc_slug):
-    """
-    Return all contractor names for a MATOC.
-    """
     table = table_for(matoc_slug)
-
     conn = get_connection()
-
     query = f"""
         SELECT DISTINCT awardee
         FROM {table}
@@ -499,22 +469,14 @@ def get_contractors(matoc_slug):
           AND awardee <> ''
         ORDER BY awardee
     """
-
     df = pd.read_sql(query, conn)
-
     conn.close()
-
     return df["awardee"].tolist()
 
+
 def get_contractor_dataframe(matoc_slug, contractor):
-    """
-    Return all records for one contractor.
-    """
-
     table = table_for(matoc_slug)
-
     conn = get_connection()
-
     query = f"""
         SELECT
             year AS `Year`,
@@ -532,11 +494,8 @@ def get_contractor_dataframe(matoc_slug, contractor):
         FROM {table}
         WHERE awardee=%s
     """
-
     df = pd.read_sql(query, conn, params=(contractor,))
-
     conn.close()
-
     return df
 
 
@@ -548,3 +507,37 @@ def delete_row(matoc_slug: str, row_id: int):
     conn.commit()
     cur.close()
     conn.close()
+
+def invalidate_user_session(session_id):
+    """Deactivates a user session in the database upon logout."""
+    if not session_id:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE user_sessions
+        SET is_active = 0, expires_at = NOW()
+        WHERE session_id = %s
+    """, (session_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def is_session_active(session_id):
+    """Check if the session_id exists, is marked active, and has not expired."""
+    if not session_id:
+        return False
+        
+    conn = get_connection()
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute("""
+                SELECT id FROM user_sessions
+                WHERE session_id = %s 
+                  AND is_active = 1 
+                  AND expires_at > NOW()
+            """, (session_id,))
+            session_record = cursor.fetchone()
+            return bool(session_record)
+    finally:
+        conn.close()

@@ -1,6 +1,8 @@
 from functools import wraps
 import io
 import os
+import uuid
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from flask import (
@@ -26,6 +28,9 @@ from db import (
     COLUMN_MAP,
     check_login,
     create_matoc,
+    create_user_session,
+    invalidate_user_session,
+    is_session_active,
     delete_matoc,
     delete_row,
     get_contractor_dataframe,
@@ -94,9 +99,29 @@ def _asterisk_filter_on() -> bool:
 # Auth Routes
 # --------------------------------------------------------------------------
 
+@app.before_request
+def check_session_validity():
+    """Validates session_id against DB on every request. 
+    If missing or inactive, forces logout."""
+    
+    # Skip check for static files and the login route to avoid infinite redirects
+    if request.endpoint in ("login", "static"):
+        return
+
+    # Check if the user claims to be logged in
+    if session.get("logged_in"):
+        session_id = session.get("session_id")
+        
+        # If session_id is missing or marked inactive/expired in DB
+        if not session_id or not is_session_active(session_id):
+            session.clear()  # Clear cookies/session
+            flash("Your session has expired or is invalid. Please log in again.")
+            return redirect(url_for("login"))
+        
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    # CHANGE 1: If user is ALREADY logged in, redirect them directly to index
+
+    # Already logged in
     if session.get("logged_in"):
         return redirect(url_for("index"))
 
@@ -104,37 +129,85 @@ def login():
     error = None
 
     if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
 
-        # Check DB authentication (MySQL / Database check)
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        # Authenticate from database
         user = check_login(username, password) if username else None
 
         if user:
+
+            # Flask session
+            session.permanent = True
             session["logged_in"] = True
             session["username"] = user["username"]
             session["user_id"] = user["id"]
-            session["is_admin"] = user.get("is_admin", False)
+            session["is_admin"] = bool(user.get("is_admin", False))
+
+            # Generate unique session ID
+            session_uuid = str(uuid.uuid4())
+            session["session_id"] = session_uuid
+
+            # Session expires in 45 minutes
+            expires_at = datetime.now() + timedelta(minutes=45)
+
+            # Save session in database
+            create_user_session(
+                user_id=user["id"],
+                session_id=session_uuid,
+                expires_at=expires_at,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get("User-Agent")
+            )
+
             return redirect(next_url)
 
-        # Fallback to direct admin password check
+        # Admin fallback login
         elif password == ADMIN_PASSWORD:
+
+            session.permanent = True
             session["logged_in"] = True
             session["username"] = "admin"
+            session["user_id"] = 0
             session["is_admin"] = True
+
+            session_uuid = str(uuid.uuid4())
+            session["session_id"] = session_uuid
+
+            expires_at = datetime.now() + timedelta(minutes=45)
+
+            create_user_session(
+                user_id=0,
+                session_id=session_uuid,
+                expires_at=expires_at,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get("User-Agent")
+            )
+
             return redirect(next_url)
 
         error = "Invalid credentials. Please try again."
         flash(error)
 
-    return render_template("login_main.html", error=error, next_url=next_url)
-
+    return render_template(
+        "login_main.html",
+        error=error,
+        next_url=next_url
+    )
 
 @app.route("/logout")
 def logout():
-    session.clear()  # Clears session cookie data
+    # 1. Retrieve current session_id before clearing
+    session_id = session.get("session_id")
+    
+    # 2. Invalidate session in the database
+    if session_id:
+        invalidate_user_session(session_id)
+    
+    # 3. Clear session cookies and redirect
+    session.clear()
     return redirect(url_for("login"))
-
 
 # --------------------------------------------------------------------------
 # Landing Page + Main Dashboard (Protected with @login_required)
