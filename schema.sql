@@ -261,13 +261,30 @@ CREATE TABLE IF NOT EXISTS bids_usag_hi(
 -- ------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    username      VARCHAR(150) UNIQUE NOT NULL,
+    password      VARCHAR(255) NOT NULL,
+    email         VARCHAR(255) UNIQUE,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_admin      TINYINT(1) NOT NULL DEFAULT 0
 );
 
-ALTER TABLE users
-ADD COLUMN is_admin TINYINT(1) NOT NULL DEFAULT 0;
+-- If you already have a `users` table without the email column, run this
+-- once in phpMyAdmin's SQL tab instead of recreating the table:
+-- ALTER TABLE users ADD COLUMN email VARCHAR(255) UNIQUE AFTER username;
 
 -- then flag your real admin account:
 --UPDATE users SET is_admin = 1 WHERE username = 'admin';
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+    id             INT AUTO_INCREMENT PRIMARY KEY,
+    user_id        INT NOT NULL,
+    session_id     VARCHAR(36) NOT NULL,
+    login_time     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_activity  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at     TIMESTAMP NOT NULL,
+    ip_address     VARCHAR(45),
+    user_agent     VARCHAR(255),
+    is_active      TINYINT(1) NOT NULL DEFAULT 1,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);

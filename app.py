@@ -1,15 +1,19 @@
 from functools import wraps
 import io
 import os
+import secrets
+import threading
 import uuid
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
+from authlib.integrations.flask_client import OAuth
 from flask import (
     Flask,
     Response,
     abort,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -18,11 +22,36 @@ from flask import (
     url_for,
 )
 import pandas as pd
+from werkzeug.security import generate_password_hash
+from openpyxl.styles import Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
+# Columns that should be rendered as US-style currency (comma thousands
+# separator + 2 decimals) both in the on-screen Raw Data view and in the
+# downloaded .xlsx export. Keep this in sync with the whitelist used in
+# templates/raw_data.html.
+CURRENCY_COLUMNS = [
+    "contract value", "addon bid", "asterisk bid", "winner price difference $",
+    "total", "mods", "master obligation", "master base & options",
+    "master base & exercised", "linked mods total",
+]
+
+THIN_BORDER = Border(
+    left=Side(style="thin", color="B0B0B0"),
+    right=Side(style="thin", color="B0B0B0"),
+    top=Side(style="thin", color="B0B0B0"),
+    bottom=Side(style="thin", color="B0B0B0"),
+)
+
+import pull_pipeline
 from charts import (
     build_contractor_project_chart,
     build_contractor_year_chart,
     build_full_dashboard_html,
+    build_mods_timeline_chart,
+    build_mods_by_project_type_chart,
+    build_mods_by_award_chart,
+    build_mods_count_by_award_chart,
 )
 from db import (
     COLUMN_MAP,
@@ -36,12 +65,18 @@ from db import (
     get_contractor_dataframe,
     get_contractors,
     get_matocs,
+    get_modification_dataframe,
     load_matoc_dataframe,
     load_raw_dataframe,
     truncate_matoc_table,
     update_cell,
     upsert_dataframe,
+    load_raw_dataframe_with_awards,
+    get_user_by_username,
+    get_user_by_email,
+    register_user
 )
+from email_utils import send_otp_email
 
 load_dotenv()
 
@@ -52,6 +87,18 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 # Admin password default fallback
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+
+# --------------------------------------------------------------------------
+# Google OAuth ("Login with Google")
+# --------------------------------------------------------------------------
+oauth = OAuth(app)
+google_oauth = oauth.register(
+    name="google",
+    client_id=os.environ.get("GOOGLE_CLIENT_ID"),
+    client_secret=os.environ.get("GOOGLE_CLIENT_SECRET"),
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile"},
+)
 
 
 # --------------------------------------------------------------------------
@@ -105,7 +152,7 @@ def check_session_validity():
     If missing or inactive, forces logout."""
     
     # Skip check for static files and the login route to avoid infinite redirects
-    if request.endpoint in ("login", "static"):
+    if request.endpoint in ("login", "static", "login_google", "login_google_callback"):
         return
 
     # Check if the user claims to be logged in
@@ -117,7 +164,225 @@ def check_session_validity():
             session.clear()  # Clear cookies/session
             flash("Your session has expired or is invalid. Please log in again.")
             return redirect(url_for("login"))
-        
+
+def _generate_otp() -> str:
+    """Generates a cryptographically-random 6 digit OTP."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _send_registration_otp():
+    """(Re)generates an OTP for the pending registration in the session and
+    emails it via SendGrid. Returns (success, message)."""
+    pending = session.get("pending_registration")
+    if not pending:
+        return False, "No pending registration found."
+
+    otp = _generate_otp()
+    pending["otp"] = otp
+    pending["otp_expires_at"] = (datetime.now() + timedelta(minutes=10)).isoformat()
+    session["pending_registration"] = pending
+
+    ok, msg = send_otp_email(pending["email"], otp, pending["username"])
+    return ok, msg
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    # If already logged in, redirect home
+    if session.get("logged_in"):
+        return redirect(url_for("index"))
+
+    next_url = request.args.get("next") or request.form.get("next") or url_for("index")
+    error = None
+
+    if request.method == "POST":
+        stage = request.form.get("stage", "register")
+
+        # ------------------------------------------------------------
+        # Stage 1: collect username/email/password, send OTP to email
+        # ------------------------------------------------------------
+        if stage == "register":
+            username = request.form.get("username", "").strip()
+            email = request.form.get("email", "").strip().lower()
+            password = request.form.get("password", "")
+
+            if not username or not email or not password:
+                error = "Username, email and password are required."
+            elif get_user_by_username(username):
+                error = "Username is already taken. Please choose another."
+            elif get_user_by_email(email):
+                error = "An account with that email already exists."
+            else:
+                session["pending_registration"] = {
+                    "username": username,
+                    "email": email,
+                    "password_hash": generate_password_hash(password),
+                }
+                ok, msg = _send_registration_otp()
+                if ok:
+                    flash(f"We sent a verification code to {email}.")
+                else:
+                    session.pop("pending_registration", None)
+                    error = f"Could not send verification email: {msg}"
+
+            if error:
+                flash(error)
+
+        # ------------------------------------------------------------
+        # Stage 2: resend the OTP
+        # ------------------------------------------------------------
+        elif stage == "resend":
+            ok, msg = _send_registration_otp()
+            if ok:
+                flash("A new verification code has been sent.")
+            else:
+                flash(f"Could not resend code: {msg}")
+
+        # ------------------------------------------------------------
+        # Stage 3: verify OTP, create the account, auto-login
+        # ------------------------------------------------------------
+        elif stage == "verify":
+            pending = session.get("pending_registration")
+            entered_otp = request.form.get("otp", "").strip()
+
+            if not pending:
+                error = "Your registration session expired. Please start again."
+            elif datetime.now() > datetime.fromisoformat(pending["otp_expires_at"]):
+                error = "That code has expired. Please request a new one."
+            elif entered_otp != pending.get("otp"):
+                error = "Incorrect verification code. Please try again."
+            else:
+                user_id = register_user(
+                    pending["username"], pending["password_hash"], pending["email"]
+                )
+                if user_id:
+                    session.pop("pending_registration", None)
+
+                    session.permanent = True
+                    session["logged_in"] = True
+                    session["username"] = pending["username"]
+                    session["user_id"] = user_id
+                    session["is_admin"] = False
+
+                    session_uuid = str(uuid.uuid4())
+                    session["session_id"] = session_uuid
+                    expires_at = datetime.now() + timedelta(minutes=45)
+
+                    create_user_session(
+                        user_id=user_id,
+                        session_id=session_uuid,
+                        expires_at=expires_at,
+                        ip_address=request.remote_addr,
+                        user_agent=request.headers.get("User-Agent")
+                    )
+
+                    flash("Account created successfully!")
+                    return redirect(next_url)
+                else:
+                    error = "Failed to create account. Please try again."
+
+            if error:
+                flash(error)
+
+    return render_template(
+        "register_main.html",
+        error=error,
+        next_url=next_url,
+        awaiting_otp=bool(session.get("pending_registration")),
+        pending_email=(session.get("pending_registration") or {}).get("email"),
+    )
+
+def _establish_session(user_id, username, email, is_admin=False):
+    """Sets Flask session keys + creates a DB-tracked session row.
+    Shared by password login, registration, and Google OAuth login."""
+    session.permanent = True
+    session["logged_in"] = True
+    session["username"] = username
+    session["email"] = email
+    session["user_id"] = user_id
+    session["is_admin"] = bool(is_admin)
+
+    session_uuid = str(uuid.uuid4())
+    session["session_id"] = session_uuid
+    expires_at = datetime.now() + timedelta(minutes=45)
+
+    create_user_session(
+        user_id=user_id,
+        session_id=session_uuid,
+        expires_at=expires_at,
+        ip_address=request.remote_addr,
+        user_agent=request.headers.get("User-Agent"),
+    )
+
+
+@app.route("/login/google")
+def login_google():
+    """Kicks off the Google OAuth redirect."""
+    if session.get("logged_in"):
+        return redirect(url_for("index"))
+
+    next_url = request.args.get("next") or url_for("index")
+    session["oauth_next"] = next_url
+    redirect_uri = url_for("login_google_callback", _external=True)
+    return google_oauth.authorize_redirect(redirect_uri)
+
+
+@app.route("/login/google/callback")
+def login_google_callback():
+    """Handles Google's redirect back, finds-or-creates the user, logs them in."""
+    next_url = session.pop("oauth_next", None) or url_for("index")
+
+    try:
+        token = google_oauth.authorize_access_token()
+        userinfo = token.get("userinfo")
+        if not userinfo:
+            userinfo = google_oauth.parse_id_token(token)
+    except Exception as e:
+        flash(f"Google sign-in failed: {e}")
+        return redirect(url_for("login"))
+
+    email = (userinfo.get("email") or "").strip().lower()
+    if not email:
+        flash("Google did not return an email address for this account.")
+        return redirect(url_for("login"))
+    if not userinfo.get("email_verified", True):
+        flash("Please use a verified Google email address.")
+        return redirect(url_for("login"))
+
+    user = get_user_by_email(email)
+
+    if user:
+        _establish_session(
+            user_id=user["id"],
+            username=user["username"],
+            email=user["email"],
+            is_admin=bool(user.get("is_admin", False)),
+        )
+    else:
+        # First time this Google account has signed in -> auto-register.
+        base_username = (userinfo.get("name") or email.split("@")[0]).strip()
+        base_username = base_username.replace(" ", "_") or "user"
+        username = base_username
+        suffix = 1
+        while get_user_by_username(username):
+            suffix += 1
+            username = f"{base_username}{suffix}"
+
+        # Google-authenticated accounts don't have a usable local password;
+        # store an unguessable random hash so password login is a no-op.
+        unusable_hash = generate_password_hash(secrets.token_hex(32))
+        user_id = register_user(username, unusable_hash, email)
+
+        if not user_id:
+            flash("Could not create an account for that Google login. Please try again.")
+            return redirect(url_for("login"))
+
+        _establish_session(user_id=user_id, username=username, email=email, is_admin=False)
+        flash("Account created via Google sign-in.")
+
+    return redirect(next_url)
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
 
@@ -130,11 +395,11 @@ def login():
 
     if request.method == "POST":
 
-        username = request.form.get("username", "").strip()
+        email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
 
         # Authenticate from database
-        user = check_login(username, password) if username else None
+        user = check_login(email, password) if email else None
 
         if user:
 
@@ -142,6 +407,7 @@ def login():
             session.permanent = True
             session["logged_in"] = True
             session["username"] = user["username"]
+            session["email"] = user["email"]
             session["user_id"] = user["id"]
             session["is_admin"] = bool(user.get("is_admin", False))
 
@@ -268,10 +534,16 @@ def download_dashboard(slug):
 @app.route("/dashboard/<slug>/data")
 @login_required
 def raw_data(slug):
-    """Shows every row/column for this MATOC in an Excel-like grid."""
+    """Shows every row/column for this MATOC, including linked award info."""
     check_slug(slug)
-    df = load_raw_dataframe(slug)
-    columns = list(COLUMN_MAP.keys())  # Excel-style headers, in order
+
+    # Use the new joined function instead of load_raw_dataframe
+    df = load_raw_dataframe_with_awards(slug)
+
+    # Automatically includes the new columns in the grid
+    columns = list(df.columns)
+    columns.remove("id")  # Hide internal DB ID from grid header
+
     rows = df.to_dict(orient="records")
     return render_template(
         "raw_data.html",
@@ -284,16 +556,78 @@ def raw_data(slug):
     )
 
 
+@app.route("/dashboard/<slug>/data/pull-latest", methods=["POST"])
+@admin_required
+def pull_latest(slug):
+    """Kicks off a background pull of the latest USAspending.gov data for
+    every Task Order ID in THIS MATOC's table. Polled by /pull-status."""
+    check_slug(slug)
+    if pull_pipeline.is_running():
+        return jsonify({
+            "ok": False,
+            "message": f"A pull is already running ({pull_pipeline.PROGRESS.get('matoc_label')})."
+        }), 409
+
+    thread = threading.Thread(target=pull_pipeline.run_pull_job, args=(slug,), daemon=True)
+    thread.start()
+    return jsonify({"ok": True, "message": "Pull started."})
+
+
+@app.route("/dashboard/<slug>/data/pull-status")
+@login_required
+def pull_status(slug):
+    """Polled from the Raw Data page to show live progress of a pull job."""
+    check_slug(slug)
+    return jsonify(pull_pipeline.PROGRESS)
+
+
 @app.route("/dashboard/<slug>/data/export")
 @login_required
 def export_raw_data(slug):
     """Download the raw table as an .xlsx file."""
     check_slug(slug)
     matoc_label = get_matocs()[slug]
-    df = load_raw_dataframe(slug).drop(columns=["id"], errors="ignore")
+    df = load_raw_dataframe_with_awards(slug).drop(columns=["id"], errors="ignore")
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=matoc_label[:31])
+        ws = writer.sheets[matoc_label[:31]]
+        n_rows = len(df)
+        n_cols = len(df.columns)
+
+        # Wrap text on the multi-line "Modifications & Values" column so each
+        # modification shows on its own line instead of one long squashed row.
+        if "Modifications & Values" in df.columns:
+            col_idx = list(df.columns).index("Modifications & Values") + 1  # 1-based, +header offset not needed (openpyxl is 1-based already)
+            col_letter = get_column_letter(col_idx)
+            ws.column_dimensions[col_letter].width = 40
+            for row_num in range(2, n_rows + 2):  # skip header row
+                cell = ws[f"{col_letter}{row_num}"]
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        # Figure out which column positions (1-based) hold dollar values so
+        # we can give them a proper US-style "#,##0.00" number format.
+        currency_col_idx = {
+            i + 1 for i, col in enumerate(df.columns)
+            if str(col).strip().lower() in CURRENCY_COLUMNS
+        }
+
+        # Apply currency formatting + a thin border to every cell (header
+        # and data, all columns) so the sheet looks like a real table.
+        for row_num in range(1, n_rows + 2):
+            for col_num in range(1, n_cols + 1):
+                cell = ws.cell(row=row_num, column=col_num)
+                cell.border = THIN_BORDER
+                if row_num > 1 and col_num in currency_col_idx:
+                    cell.number_format = "#,##0.00"
+
+        # Reasonable default column widths (skip the one we already sized).
+        for i, col in enumerate(df.columns, start=1):
+            col_letter = get_column_letter(i)
+            if col == "Modifications & Values":
+                continue
+            header_len = len(str(col))
+            ws.column_dimensions[col_letter].width = max(12, min(30, header_len + 4))
     buf.seek(0)
     filename = f"{matoc_label.replace(' ', '_')}_Data.xlsx"
     return send_file(
@@ -314,8 +648,8 @@ def update_data(slug):
     column = payload.get("column")
     value = payload.get("value", "")
     try:
-        update_cell(slug, row_id, column, value)
-        return {"ok": True}
+        derived = update_cell(slug, row_id, column, value)
+        return {"ok": True, "derived": derived}
     except Exception as e:
         return {"ok": False, "error": str(e)}, 400
 
@@ -397,6 +731,72 @@ def contractor_intelligence(slug):
         yearly_chart=yearly_chart,
         project_chart=project_chart,
         recent=recent,
+    )
+
+
+@app.route("/dashboard/<slug>/modifications")
+@login_required
+def modification_intelligence(slug):
+    """Detail page on post-award MODIFICATIONS: every modification row pulled
+    from USAspending (via award_master/award_modifications), not just the
+    single 'Mods' dollar figure from the spreadsheet. This is what CEO-level
+    questions like 'why did this contract balloon' actually need."""
+    check_slug(slug)
+    matoc_label = get_matocs()[slug]
+
+    df = get_modification_dataframe(slug)
+
+    if df.empty:
+        return render_template(
+            "modification_intelligence.html",
+            slug=slug,
+            matoc_label=matoc_label,
+            has_data=False,
+            stats=None,
+            timeline_chart=None,
+            project_chart=None,
+            award_chart=None,
+            count_chart=None,
+            detail=[],
+        )
+
+    total_mods = len(df)
+    total_mod_value = float(df["Mod Value"].sum())
+    awards_with_mods = df["Award/PIID"].nunique()
+    avg_mod_value = float(df["Mod Value"].mean()) if total_mods else 0.0
+
+    largest = df.loc[df["Mod Value"].idxmax()]
+    stats = {
+        "total_mods": total_mods,
+        "total_mod_value": total_mod_value,
+        "awards_with_mods": awards_with_mods,
+        "avg_mod_value": avg_mod_value,
+        "largest_mod_value": float(largest["Mod Value"]),
+        "largest_mod_award": largest["Award/PIID"],
+        "largest_mod_awardee": largest["Awardee"],
+    }
+
+    timeline_chart = build_mods_timeline_chart(df)
+    project_chart = build_mods_by_project_type_chart(df)
+    award_chart = build_mods_by_award_chart(df)
+    count_chart = build_mods_count_by_award_chart(df)
+
+    detail_df = df.sort_values("Action Date", ascending=False).copy()
+    detail_df["Action Date"] = detail_df["Action Date"].dt.strftime("%Y-%m-%d")
+    detail_df["Action Date"] = detail_df["Action Date"].fillna("")
+    detail = detail_df.to_dict("records")
+
+    return render_template(
+        "modification_intelligence.html",
+        slug=slug,
+        matoc_label=matoc_label,
+        has_data=True,
+        stats=stats,
+        timeline_chart=timeline_chart,
+        project_chart=project_chart,
+        award_chart=award_chart,
+        count_chart=count_chart,
+        detail=detail,
     )
 
 
@@ -542,7 +942,34 @@ def admin_editor_save():
     except Exception as e:
         return redirect(url_for("admin_editor", file=rel_path, error=f"Save failed: {e}"))
 
+@app.template_filter('usd')
+def usd_format(value, col_name=""):
+    if value is None or value == "":
+        return ""
+    
+    # Skip non-currency columns
+    col = str(col_name).lower().trim()
+    if col in ['year'] or 'id' in col or 'number of offers' in col:
+        return value
 
+    try:
+        # Convert to float and format with commas and 2 decimals
+        num = float(str(value).replace(',', '').replace('$', '').strip())
+        return f"{num:,.2f}"
+    except (ValueError, TypeError):
+        return value
+
+@app.template_filter('format_currency')
+def format_currency(value):
+    if value is None or value == '':
+        return ''
+    try:
+        # Strip existing commas or dollar signs if present
+        clean_val = str(value).replace(',', '').replace('$', '').strip()
+        val_float = float(clean_val)
+        return f"{val_float:,.2f}"
+    except (ValueError, TypeError):
+        return value    
 # --------------------------------------------------------------------------
 # Application Entry Point
 # --------------------------------------------------------------------------

@@ -94,6 +94,9 @@ def prepare_dataframe(df: pd.DataFrame, exclude_asterisk_bids: bool = True) -> p
     )
     df["PriceBand"] = df["PriceDiffPct"].apply(price_band)
     df["Asterisk Bid"] = (df["Asterisk Bid"].fillna("").astype(str).str.strip().str.upper())
+    
+    # Store whether ANY row actually has an asterisk bid
+    df.attrs["has_asterisk_bid"] = (df["Asterisk Bid"] == "YES").any()
 
     if exclude_asterisk_bids:
         mask = df["Asterisk Bid"] == "YES"
@@ -867,9 +870,10 @@ def build_full_dashboard_html(raw_df: pd.DataFrame, matoc_label: str,
       <div class='toolbar'>
         <a class='primary' href='/dashboard/{slug}/download?asterisk={"on" if exclude_asterisk_bids else "off"}'>&#8681; Download Dashboard</a>
         <a href='/dashboard/{slug}/data'>&#128202; View Raw Data (Excel view)</a>
-        <a class='{"admin" if exclude_asterisk_bids else ""}' style='{"" if exclude_asterisk_bids else "background:#8B949E;border-color:#8B949E;color:#0D1117;"}' href='/dashboard/{slug}?asterisk={"off" if exclude_asterisk_bids else "on"}' title='When ON, bids flagged Asterisk Bid are excluded (treated as No Bid). When OFF, they count normally.'>
-          &#10033; Asterisk Bid Filter: {"ON" if exclude_asterisk_bids else "OFF"}
-        </a>
+        <a href='/dashboard/{slug}/modifications'>&#128172; Modification Intelligence</a>
+        {f'''<a class="{'admin' if exclude_asterisk_bids else ''}" style="{'' if exclude_asterisk_bids else 'background:#8B949E;border-color:#8B949E;color:#0D1117;'}" href="/dashboard/{slug}?asterisk={'off' if exclude_asterisk_bids else 'on'}" title="When ON, bids flagged Asterisk Bid are excluded (treated as No Bid). When OFF, they count normally.">
+          &#10033; Exclude Asterisk Bids: {"OFF" if exclude_asterisk_bids else "ON"}
+        </a>''' if df.attrs.get("has_asterisk_bid") else ''}
         {"<a class='admin' href='/logout'>Log Out Admin</a>" if is_admin else "<a href='/login?next=/dashboard/" + str(slug) + "/data'>Admin Login</a>"}
       </div>
       {kpi_html}
@@ -930,6 +934,97 @@ def build_full_dashboard_html(raw_df: pd.DataFrame, matoc_label: str,
 </html>
 """)
     return "".join(parts)
+
+
+def build_mods_timeline_chart(df: pd.DataFrame):
+    """Monthly modification $ volume over time, from the real award_modifications
+    detail rows (not the spreadsheet Mods column)."""
+    if df.empty:
+        return "<p>No modification data available.</p>"
+    tmp = df.dropna(subset=["Action Date"]).copy()
+    if tmp.empty:
+        return "<p>No dated modifications available.</p>"
+    tmp["Month"] = tmp["Action Date"].dt.to_period("M").dt.to_timestamp()
+    chart = tmp.groupby("Month", as_index=False)["Mod Value"].sum().sort_values("Month")
+    fig = px.bar(chart, x="Month", y="Mod Value", title="Modification Value by Month")
+    fig.update_traces(marker_color=GOLD)
+    fig.update_layout(template="plotly_dark", paper_bgcolor=BG2, plot_bgcolor=BG2,
+                       margin=dict(l=20, r=20, t=50, b=20), height=450,
+                       yaxis_title="Modification Value ($)", xaxis_title="Month")
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def build_mods_by_project_type_chart(df: pd.DataFrame):
+    """Which project types are absorbing the most modification $$."""
+    if df.empty:
+        return "<p>No modification data available.</p>"
+    chart = (
+        df.groupby("Project Type", as_index=False)["Mod Value"].sum()
+        .sort_values("Mod Value", ascending=False).head(10)
+    )
+    if chart.empty:
+        return "<p>No modification data available.</p>"
+    labels = [f"${v/1_000_000:.1f}M" if v >= 1_000_000 else f"${v:,.0f}" for v in chart["Mod Value"]]
+    fig = px.bar(chart, x="Mod Value", y="Project Type", orientation="h",
+                 title="Modification Value by Project Type",
+                 color="Mod Value", color_continuous_scale="Oranges")
+    fig.update_traces(text=labels, textposition="outside")
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(template="plotly_dark", paper_bgcolor=BG2, plot_bgcolor=BG2,
+                       margin=dict(l=20, r=20, t=50, b=20), height=500,
+                       coloraxis_showscale=False, xaxis_title="Modification Value ($)")
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def build_mods_by_award_chart(df: pd.DataFrame):
+    """Which specific awards/PIIDs have racked up the most modification $$."""
+    if df.empty:
+        return "<p>No modification data available.</p>"
+    chart = (
+        df.groupby(["Award/PIID", "Awardee"], as_index=False)["Mod Value"].sum()
+        .sort_values("Mod Value", ascending=False).head(15)
+    )
+    if chart.empty:
+        return "<p>No modification data available.</p>"
+    chart["Label"] = chart["Award/PIID"].astype(str) + " - " + chart["Awardee"].fillna("Unknown")
+    labels = [f"${v/1_000_000:.1f}M" if v >= 1_000_000 else f"${v:,.0f}" for v in chart["Mod Value"]]
+    fig = px.bar(chart, x="Mod Value", y="Label", orientation="h",
+                 title="Top 15 Awards by Total Modification Value",
+                 color="Mod Value", color_continuous_scale="Reds")
+    fig.update_traces(text=labels, textposition="outside")
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(template="plotly_dark", paper_bgcolor=BG2, plot_bgcolor=BG2,
+                       margin=dict(l=20, r=20, t=50, b=20), height=550,
+                       coloraxis_showscale=False, xaxis_title="Modification Value ($)")
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def build_mods_count_by_award_chart(df: pd.DataFrame):
+    """Which awards get modified the MOST OFTEN (count, not dollars) - flags
+    contracts that keep getting reopened/changed, which is often what a CEO
+    is actually worried about."""
+    if df.empty:
+        return "<p>No modification data available.</p>"
+    chart = (
+        df.groupby(["Award/PIID", "Awardee"], as_index=False)
+        .agg(Mod_Count=("Modification #", "count"), Mod_Total=("Mod Value", "sum"))
+        .sort_values("Mod_Count", ascending=False).head(15)
+    )
+    if chart.empty:
+        return "<p>No modification data available.</p>"
+    chart["Label"] = chart["Award/PIID"].astype(str) + " - " + chart["Awardee"].fillna("Unknown")
+    fig = px.bar(chart, x="Mod_Count", y="Label", orientation="h",
+                 title="Top 15 Most-Modified Awards (by # of Mods)",
+                 color="Mod_Count", color_continuous_scale="Purples",
+                 custom_data=["Mod_Total"])
+    fig.update_traces(
+        hovertemplate="<b>%{y}</b><br>Modifications: %{x}<br>Total Mod Value: $%{customdata[0]:,.0f}<extra></extra>"
+    )
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(template="plotly_dark", paper_bgcolor=BG2, plot_bgcolor=BG2,
+                       margin=dict(l=20, r=20, t=50, b=20), height=550,
+                       coloraxis_showscale=False, xaxis_title="Number of Modifications")
+    return fig.to_html(full_html=False, include_plotlyjs=False)
 
 
 def build_contractor_year_chart(df):

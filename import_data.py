@@ -40,13 +40,13 @@ def main():
     df = pd.read_excel(args.file, sheet_name=args.sheet)
     stats = upsert_dataframe(args.matoc, df)
 
-    print(
-        f"Import into '{tables[args.matoc]}' from '{args.file}' complete:\n"
-        f"  inserted (new Folder Number):   {stats['inserted']}\n"
-        f"  updated  (values changed):      {stats['updated']}\n"
-        f"  unchanged (already up to date): {stats['unchanged']}\n"
-        f"  skipped  (missing Folder Number): {stats['skipped']}"
-    )
+    #print(
+     #   f"Import into '{tables[args.matoc]}' from '{args.file}' complete:\n"
+      #  f"  inserted (new Folder Number):   {stats['inserted']}\n"
+       # f"  updated  (values changed):      {stats['updated']}\n"
+        #f"  unchanged (already up to date): {stats['unchanged']}\n"
+        #f"  skipped  (missing Folder Number): {stats['skipped']}"
+    #)
 
 
 if __name__ == "__main__":

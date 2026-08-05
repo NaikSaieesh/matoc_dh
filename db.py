@@ -16,6 +16,7 @@ import os
 import uuid
 from datetime import datetime, timedelta
 import pandas as pd
+import numpy as np
 import mysql.connector
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
@@ -150,6 +151,21 @@ def check_login(username, password):
     finally:
         conn.close()
 
+def check_login(email, password):
+    conn = get_connection()
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT * FROM users WHERE email = %s",
+                (email.strip().lower(),)
+            )
+            user = cursor.fetchone()
+
+            if user and check_password_hash(user["password"], password):
+                return user
+            return None
+    finally:
+        conn.close()
 
 def create_user_session(user_id, session_id, expires_at, ip_address, user_agent):
     conn = get_connection()
@@ -310,6 +326,28 @@ NUMERIC_COLS = [
 
 KEY_COL = "folder_number"
 
+# Columns that, when changed, require the 3 calculated fields below to be
+# recomputed:
+#   Winner Price Difference $  = Addon Bid - Contract Value
+#   Winner Price Difference %  = (Winner Price Difference $ / Contract Value) * 100
+#   Total                      = Contract Value + Mods
+DERIVED_TRIGGER_COLS = {"contract_value", "addon_bid", "mods"}
+
+
+def _calc_derived(contract_value, addon_bid, mods):
+    """Given the 3 raw inputs, returns (winner_price_diff_usd,
+    winner_price_diff_pct, total). Guards against divide-by-zero when
+    Contract Value is 0/empty."""
+    contract_value = float(contract_value or 0)
+    addon_bid = float(addon_bid or 0)
+    mods = float(mods or 0)
+
+    diff_usd = addon_bid - contract_value
+    diff_pct = (diff_usd / contract_value * 100) if contract_value else 0.0
+    total = contract_value + mods
+
+    return diff_usd, diff_pct, total
+
 
 def table_for(slug: str) -> str:
     tables = get_tables()
@@ -317,6 +355,55 @@ def table_for(slug: str) -> str:
         raise KeyError(f"Unknown MATOC slug '{slug}'")
     return tables[slug]
 
+
+def load_raw_dataframe_with_awards(matoc_slug: str) -> pd.DataFrame:
+    """Loads raw bid data joined with the award_master and award_modifications 
+    tables from the external database using 'award_id' == 'piid'.
+    """
+    table = table_for(matoc_slug)
+    conn = get_connection()
+
+    # Build base bid table column list
+    unique_cols = list(dict.fromkeys(COLUMN_MAP.values()))
+    bids_cols_sql = ", ".join(f"b.`{db}`" for db in unique_cols)
+
+    query = f"""
+        SELECT 
+            b.id,
+            {bids_cols_sql},
+            am.piid                                             AS `Task Order/PIID`,
+            am.recipient_name                                   AS `Recipient`,
+            am.total_obligation                                 AS `Obligation`,
+            am.base_and_all_options                             AS `Base & Options`,
+            am.base_exercised_options                           AS `Base & Exercised`,
+            am.status                                           AS `Status`,
+            COALESCE(
+                GROUP_CONCAT(
+                    CONCAT(
+                        COALESCE(m.modification_number, 'Mod'), 
+                        ': $', 
+                        FORMAT(COALESCE(m.federal_action_obligation, 0), 2)
+                    ) 
+                    SEPARATOR '\n'
+                ), 
+                'None'
+            )                                                   AS `Modifications & Values`,
+            COALESCE(SUM(m.federal_action_obligation), 0)       AS `Linked Mods Total`
+        FROM `{table}` b
+        LEFT JOIN `award_master` am 
+            ON TRIM(b.award_id) = TRIM(am.piid)
+        LEFT JOIN `award_modifications` m 
+            ON am.id = m.award_master_id
+        GROUP BY b.id, am.id
+        ORDER BY b.id
+    """
+
+    df = pd.read_sql(query, conn)
+    conn.close()
+
+    # Rename database column keys back to human-readable Excel headers
+    df = df.rename(columns=DB_TO_LABEL)
+    return df
 
 def load_matoc_dataframe(matoc_slug: str) -> pd.DataFrame:
     table = table_for(matoc_slug)
@@ -368,9 +455,34 @@ def update_cell(matoc_slug: str, row_id: int, column_label: str, value: str):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(f"UPDATE {table} SET `{db_col}` = %s WHERE id = %s", (value, row_id))
+
+    # If the edited field feeds one of the calculated columns, re-read the
+    # 3 raw inputs (post-edit) and recompute/save Winner Price Difference $,
+    # Winner Price Difference %, and Total in the same request. Returned so
+    # the caller (Flask route -> browser) can patch those cells live.
+    derived = None
+    if db_col in DERIVED_TRIGGER_COLS:
+        cur.execute(
+            f"SELECT contract_value, addon_bid, mods FROM {table} WHERE id = %s",
+            (row_id,),
+        )
+        contract_value, addon_bid, mods = cur.fetchone()
+        diff_usd, diff_pct, total = _calc_derived(contract_value, addon_bid, mods)
+        cur.execute(
+            f"UPDATE {table} SET winner_price_diff_usd = %s, "
+            f"winner_price_diff_pct = %s, total = %s WHERE id = %s",
+            (diff_usd, diff_pct, total, row_id),
+        )
+        derived = {
+            "Winner Price Difference $": diff_usd,
+            "Winner Price Difference %": round(diff_pct, 2),
+            "Total": total,
+        }
+
     conn.commit()
     cur.close()
     conn.close()
+    return derived
 
 
 def _clean_import_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -402,6 +514,25 @@ def _clean_import_df(df: pd.DataFrame) -> pd.DataFrame:
                 "project_type", "awardee", "result", "folder_number", "asterisk_bid"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().replace({"nan": ""})
+
+    # Recalculate Winner Price Difference $ / % and Total from the raw inputs
+    # instead of trusting whatever formulas/values were baked into the
+    # uploaded spreadsheet - keeps the math consistent no matter how the
+    # data got in (import vs. manual edit in the grid).
+    for col in ("contract_value", "addon_bid", "mods"):
+        if col not in df.columns:
+            df[col] = 0.0
+
+    contract_value = df["contract_value"]
+    addon_bid = df["addon_bid"]
+    mods = df["mods"]
+
+    diff_usd = addon_bid - contract_value
+    diff_pct = np.where(contract_value != 0, (diff_usd / contract_value) * 100, 0.0)
+
+    df["winner_price_diff_usd"] = diff_usd
+    df["winner_price_diff_pct"] = np.round(diff_pct, 2)
+    df["total"] = contract_value + mods
 
     return df
 
@@ -457,6 +588,46 @@ def upsert_dataframe(matoc_slug: str, df: pd.DataFrame) -> dict:
     cur.close()
     conn.close()
     return stats
+
+
+def get_modification_dataframe(matoc_slug: str) -> pd.DataFrame:
+    """One row PER MODIFICATION (not per award) - the real detail behind the
+    'Modifications & Values' summary column, joined back to the bid so you
+    still have Awardee / Project Type / Folder Number for context.
+
+    Uses INNER JOINs on purpose: this view is only about awards that actually
+    HAVE at least one modification row in the shared award_modifications table.
+    """
+    table = table_for(matoc_slug)
+    conn = get_connection()
+    query = f"""
+        SELECT
+            b.folder_number                     AS `Folder Number`,
+            b.award_id                          AS `Award/PIID`,
+            b.awardee                           AS `Awardee`,
+            b.project_type                      AS `Project Type`,
+            b.year                              AS `Year`,
+            am.total_obligation                 AS `Total Obligation`,
+            am.status                           AS `Award Status`,
+            m.modification_number               AS `Modification #`,
+            m.action_date                       AS `Action Date`,
+            m.description                       AS `Description`,
+            m.federal_action_obligation         AS `Mod Value`
+        FROM `{table}` b
+        INNER JOIN `award_master` am
+            ON TRIM(b.award_id) = TRIM(am.piid)
+        INNER JOIN `award_modifications` m
+            ON am.id = m.award_master_id
+        ORDER BY m.action_date DESC
+    """
+    df = pd.read_sql(query, conn)
+    conn.close()
+
+    if not df.empty:
+        df["Mod Value"] = pd.to_numeric(df["Mod Value"], errors="coerce").fillna(0)
+        df["Action Date"] = pd.to_datetime(df["Action Date"], errors="coerce")
+
+    return df
 
 
 def get_contractors(matoc_slug):
@@ -539,5 +710,42 @@ def is_session_active(session_id):
             """, (session_id,))
             session_record = cursor.fetchone()
             return bool(session_record)
+    finally:
+        conn.close()
+
+def get_user_by_username(username):
+    """Checks if a username already exists in the database."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            sql = "SELECT id, username FROM users WHERE username = %s"
+            cursor.execute(sql, (username,))
+            return cursor.fetchone()
+    finally:
+        conn.close()
+
+def get_user_by_email(email):
+    """Checks if an email already exists in the database."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            sql = "SELECT id, username FROM users WHERE email = %s"
+            cursor.execute(sql, (email,))
+            return cursor.fetchone()
+    finally:
+        conn.close()
+
+def register_user(username, hashed_password, email=None):
+    """Inserts a new (already-verified) user and returns their generated ID."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            sql = "INSERT INTO users (username, password, email) VALUES (%s, %s, %s)"
+            cursor.execute(sql, (username, hashed_password, email))
+            conn.commit()
+            return cursor.lastrowid  # Returns the auto-incremented user ID
+    except Exception as e:
+        print(f"Registration Error: {e}")
+        return None
     finally:
         conn.close()
