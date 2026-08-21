@@ -735,6 +735,25 @@ def get_user_by_email(email):
     finally:
         conn.close()
 
+def create_blank_row(slug):
+    """Inserts a new empty row into the database table and returns its new ID."""
+    table = table_for(slug)  # Uses your actual table lookup function
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Generate a temporary unique folder_number to satisfy UNIQUE KEY constraints
+    temp_folder_num = f"NEW-{uuid.uuid4().hex[:8]}"
+    
+    cursor.execute(f"INSERT INTO `{table}` (folder_number) VALUES (%s)", (temp_folder_num,))
+    conn.commit()
+    
+    new_id = cursor.lastrowid
+    cursor.close()
+    conn.close()
+    
+    return new_id
+
 def register_user(username, hashed_password, email=None):
     """Inserts a new (already-verified) user and returns their generated ID."""
     conn = get_connection()

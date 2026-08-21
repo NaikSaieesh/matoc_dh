@@ -49,6 +49,12 @@
   tbody td[contenteditable="true"]:focus { outline:2px solid #58A6FF; background:#0D1117; }
   td.saved { animation: flash 1s ease; }
   @keyframes flash { from { background:#132A1D; } to { background:transparent; } }
+  tbody td.range-selected { background:rgba(31,111,235,0.22); box-shadow: inset 0 0 0 1px #1F6FEB; }
+  #data-table { user-select:none; }
+  #data-table td[contenteditable="true"]:focus { user-select:text; }
+  .kbd-hint { color:#8B949E; font-size:11.5px; margin:0 0 12px; }
+  .kbd-hint kbd { background:#161B22; border:1px solid #30363D; border-radius:4px; padding:1px 6px;
+    font-family:inherit; font-size:11px; color:#C9D1D9; }
   .del-btn { background:#3d1418; border:1px solid #F85149; color:#F85149; border-radius:6px;
     padding:4px 8px; font-size:11px; cursor:pointer; }
   .del-btn:hover { background:#F85149; color:#fff; }
@@ -66,20 +72,19 @@
 
   {% if message %}<div class="message">{{ message }}</div>{% endif %}
 
+  <p class="kbd-hint">
+    Click and drag across cells (or Shift+click) to select a range like Excel &mdash;
+    then <kbd>Ctrl/Cmd+C</kbd> to copy{% if is_admin %} and <kbd>Ctrl/Cmd+V</kbd> to paste a block of cells, <kbd>Delete</kbd> to clear a selected range{% endif %}.
+  </p>
+
   <div class="toolbar">
     <input id="search" type="text" placeholder="Search all columns...">
-    <a href="{{ url_for('contractor_intelligence', slug=slug) }}">
-        Contractor Intelligence
-    </a>
-    <a href="{{ url_for('modification_intelligence', slug=slug) }}">
-        Modification Intelligence
-    </a>
+    <a href="{{ url_for('contractor_intelligence', slug=slug) }}">Contractor Intelligence</a>
+    <a href="{{ url_for('modification_intelligence', slug=slug) }}">Modification Intelligence</a>
     <a href="{{ url_for('export_raw_data', slug=slug) }}">&#8681; Download as Excel (.xlsx)</a>
     <a href="{{ url_for('download_dashboard', slug=slug) }}">&#8681; Download Full Dashboard</a>
     {% if is_admin %}
-      <button id="pull-latest-btn" type="button">
-          &#8635; Pull Latest from USAspending.gov
-      </button>
+      <button id="pull-latest-btn" type="button">&#8635; Pull Latest from USAspending.gov</button>
       <span class="admin-badge">Admin mode</span>
       <a href="{{ url_for('logout') }}">Log Out</a>
     {% else %}
@@ -89,13 +94,10 @@
 
   {% if is_admin %}
   <div id="pull-status" class="message" style="display:none; background:#132133; border-color:#1F6FEB; color:#79B8FF;"></div>
-  {% endif %}
 
-  {% if is_admin %}
   <div class="upload-panel">
     <h3>Import / refresh data from Excel</h3>
-    <p>Matched on <strong>Folder Number</strong> - existing rows with the same Folder Number get
-       updated only if a value changed, brand-new Folder Numbers are added, nothing is ever duplicated.</p>
+    <p>Matched on <strong>Folder Number</strong> - existing rows get updated, brand-new Folder Numbers are added.</p>
     <form method="POST" action="{{ url_for('upload_data', slug=slug) }}" enctype="multipart/form-data">
       <input type="file" name="excel_file" accept=".xlsx,.xls" required>
       <input type="text" name="sheet" placeholder="Sheet name (optional)">
@@ -105,7 +107,6 @@
   {% endif %}
 
   <div class="table-wrap">
-    {% if rows %}
     <table id="data-table">
       <thead>
         <tr>
@@ -136,15 +137,128 @@
         {% endfor %}
       </tbody>
     </table>
-    {% else %}
-    <p class="empty">No data yet for this MATOC. {% if is_admin %}Use the import box above to add some.{% endif %}</p>
-    {% endif %}
   </div>
+  <div id="app-config" 
+     data-is-admin="{{ 'true' if is_admin else 'false' }}" 
+     data-columns='{{ columns | tojson }}'>
+</div>
 
 <script>
-// Live search
-const searchBox = document.getElementById('search');
+const config = document.getElementById('app-config').dataset;
+const isAdmin = config.isAdmin === 'true';
+const columnsList = JSON.parse(config.columns);
 const table = document.getElementById('data-table');
+const tableWrap = document.querySelector('.table-wrap');
+
+function tbodyRows() { 
+  return Array.from(table.querySelector('tbody').children); 
+}
+
+function cellPos(td) { 
+  return { rowIdx: tbodyRows().indexOf(td.closest('tr')), colIdx: td.cellIndex }; 
+}
+
+// 1. CELL EDITING & AUTO-SAVE LOGIC
+function bindCellEditing(td) {
+  let original = td.textContent;
+  td.addEventListener('focus', () => { 
+    original = td.textContent.trim().replace(/[$,\s]/g, "");
+    td.textContent = original;
+  });
+  
+  td.addEventListener('blur', () => {
+    const value = td.textContent.trim();
+    if (value === original) return;
+    
+    const tr = td.closest('tr');
+    let id = tr.dataset.id;
+    const column = td.getAttribute('data-column');
+    
+    const targetUrl = id 
+      ? "{{ url_for('update_data', slug=slug) }}" 
+      : "{{ url_for('create_data_row', slug=slug) }}";
+
+    fetch(targetUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: id, column: column, value: value })
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        td.classList.add('saved');
+        
+        if (!id && data.new_id) {
+          tr.dataset.id = data.new_id;
+        }
+
+        if (data.derived) {
+          Object.keys(data.derived).forEach(colName => {
+            const targetTd = tr.querySelector(`td[data-column="${colName}"]`);
+            if (targetTd) {
+              const val = data.derived[colName];
+              targetTd.textContent = colName.includes('%')
+                ? Number(val).toFixed(2)
+                : Number(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+              targetTd.classList.add('saved');
+            }
+          });
+        }
+      } else {
+        alert("Save failed");
+        td.textContent = original;
+      }
+    })
+    .catch(err => {
+      console.error(err);
+      td.textContent = original;
+    });
+  });
+}
+
+document.querySelectorAll('td[contenteditable="true"]').forEach(bindCellEditing);
+
+// 2. INFINITE SCROLL & EXCEL EMPTY ROW CREATION
+function generateEmptyRows(count = 15) {
+  if (!table) return;
+  const tbody = table.querySelector('tbody');
+
+  for (let i = 0; i < count; i++) {
+    const tr = document.createElement('tr');
+    
+    columnsList.forEach(col => {
+      const td = document.createElement('td');
+      td.setAttribute('data-column', col);
+      if (isAdmin) {
+        td.setAttribute('contenteditable', 'true');
+        bindCellEditing(td);
+      }
+      tr.appendChild(td);
+    });
+
+    if (isAdmin) {
+      const actionTd = document.createElement('td');
+      actionTd.innerHTML = `<button type="button" class="del-btn" onclick="this.closest('tr').remove()">Delete</button>`;
+      tr.appendChild(actionTd);
+    }
+
+    tbody.appendChild(tr);
+  }
+}
+
+generateEmptyRows(15);
+
+if (tableWrap) {
+  tableWrap.addEventListener('scroll', () => {
+    const distanceToBottom = tableWrap.scrollHeight - tableWrap.scrollTop - tableWrap.clientHeight;
+    if (distanceToBottom < 150) {
+      generateEmptyRows(10);
+    }
+  });
+}
+
+// 3. LIVE SEARCH
+const searchBox = document.getElementById('search');
 if (searchBox && table) {
   searchBox.addEventListener('input', () => {
     const q = searchBox.value.toLowerCase();
@@ -154,7 +268,7 @@ if (searchBox && table) {
   });
 }
 
-// Click to sort
+// 4. CLICK TO SORT
 if (table) {
   table.querySelectorAll('thead th[data-col]').forEach(th => {
     let asc = true;
@@ -178,61 +292,212 @@ if (table) {
   });
 }
 
-// Cell editing on blur
-document.querySelectorAll('td[contenteditable="true"]').forEach(td => {
-  let original = td.textContent;
-  td.addEventListener('focus', () => { 
-    original = td.textContent.trim().replace(/[$,\s]/g, "");
-    td.textContent = original;
-  });
+// 5. EXCEL RANGE SELECTION, COPY & MULTI-CELL PASTE LOGIC
+let dragAnchorTd = null;
+let dragging = false;
+let lastClickedTd = null;
+let rangeCells = [];
+let rangeActive = false;
+
+function clearRangeHighlight() {
+  table.querySelectorAll('td.range-selected').forEach(td => td.classList.remove('range-selected'));
+}
+
+function flatRange() { 
+  return rangeCells.flat ? rangeCells.flat() : [].concat(...rangeCells); 
+}
+
+function selectRange(tdA, tdB) {
+  clearRangeHighlight();
+  const headerRow = table.querySelector('thead tr');
+  const dataColCount = headerRow ? headerRow.querySelectorAll('th[data-col]').length : 0;
   
-  td.addEventListener('blur', () => {
-    const value = td.textContent.trim();
-    if (value === original) return;
-    const tr = td.closest('tr');
-    const id = tr.dataset.id;
-    const column = td.getAttribute('data-column');
-    fetch("{{ url_for('update_data', slug=slug) }}", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: id, column: column, value: value })
-    })
-    .then(r => r.json())
-    .then(data => {
-      if (data.ok) {
-        td.classList.add('saved');
-        // If this edit fed a calculated field (Contract Value / Addon Bid /
-        // Mods), the server recomputed Winner Price Difference $/% and
-        // Total - patch those cells in this row so the page reflects it
-        // immediately, no reload needed.
-        if (data.derived) {
-          Object.keys(data.derived).forEach(colName => {
-            const targetTd = tr.querySelector(`td[data-column="${colName}"]`);
-            if (targetTd) {
-              const val = data.derived[colName];
-              targetTd.textContent = colName.includes('%')
-                ? Number(val).toFixed(2)
-                : Number(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-              targetTd.classList.add('saved');
-            }
-          });
-        }
-      } else {
-        alert("Save failed");
-        td.textContent = original;
-      }
-    });
+  const a = cellPos(tdA), b = cellPos(tdB);
+  const rows = tbodyRows();
+  const r0 = Math.min(a.rowIdx, b.rowIdx), r1 = Math.max(a.rowIdx, b.rowIdx);
+  const c0 = Math.min(a.colIdx, b.colIdx);
+  const c1 = Math.min(Math.max(a.colIdx, b.colIdx), dataColCount - 1);
+  
+  rangeCells = [];
+  for (let r = r0; r <= r1; r++) {
+    const tr = rows[r];
+    if (!tr) continue;
+    const line = [];
+    for (let c = c0; c <= c1; c++) {
+      const cell = tr.children[c];
+      if (!cell) continue;
+      cell.classList.add('range-selected');
+      line.push(cell);
+    }
+    if (line.length) rangeCells.push(line);
+  }
+}
+
+if (table) {
+  const tbody = table.querySelector('tbody');
+  const headerRow = table.querySelector('thead tr');
+  const dataColCount = headerRow ? headerRow.querySelectorAll('th[data-col]').length : 0;
+
+  table.addEventListener('mousedown', (e) => {
+    const td = e.target.closest('td');
+    if (!td || !tbody.contains(td) || td.cellIndex >= dataColCount) return;
+    dragAnchorTd = td;
+    dragging = false;
   });
+
+  table.addEventListener('mousemove', (e) => {
+    if (!dragAnchorTd || e.buttons !== 1) return;
+    const td = e.target.closest('td');
+    if (!td || !tbody.contains(td) || td.cellIndex >= dataColCount) return;
+    if (td === dragAnchorTd && !dragging) return;
+    dragging = true;
+    rangeActive = true;
+    if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+    if (window.getSelection) window.getSelection().removeAllRanges();
+    selectRange(dragAnchorTd, td);
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!dragging && dragAnchorTd) {
+      clearRangeHighlight();
+      rangeActive = false;
+      rangeCells = [];
+    }
+    dragAnchorTd = null;
+    dragging = false;
+  });
+
+  table.addEventListener('click', (e) => {
+    const td = e.target.closest('td');
+    if (!td || !tbody.contains(td) || td.cellIndex >= dataColCount) return;
+    if (e.shiftKey && lastClickedTd) {
+      if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+      rangeActive = true;
+      selectRange(lastClickedTd, td);
+    } else if (!dragging) {
+      lastClickedTd = td;
+    }
+  });
+}
+
+document.addEventListener('copy', (e) => {
+  if (!rangeActive || !rangeCells.length) return;
+  const tsv = rangeCells.map(line => line.map(td => td.textContent.trim()).join('\t')).join('\n');
+  e.clipboardData.setData('text/plain', tsv);
+  e.preventDefault();
 });
 
-// Pull Latest from USAspending.gov Handler
+function saveCellFromPaste(td, value) {
+  const tr = td.closest('tr');
+  const id = tr.dataset.id;
+  const column = td.getAttribute('data-column');
+
+  const targetUrl = id 
+    ? "{{ url_for('update_data', slug=slug) }}" 
+    : "{{ url_for('create_data_row', slug=slug) }}";
+
+  fetch(targetUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: id, column: column, value: value })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      td.classList.add('saved');
+      if (!id && data.new_id) {
+        tr.dataset.id = data.new_id;
+      }
+      if (data.derived) {
+        Object.keys(data.derived).forEach(colName => {
+          const targetTd = tr.querySelector(`td[data-column="${colName}"]`);
+          if (targetTd) {
+            const val = data.derived[colName];
+            targetTd.textContent = colName.includes('%')
+              ? Number(val).toFixed(2)
+              : Number(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            targetTd.classList.add('saved');
+          }
+        });
+      }
+    }
+  })
+  .catch(err => console.error('Paste save error:', err));
+}
+
+// FIX: Multi-Cell Paste Intercept Handler
+document.addEventListener('paste', (e) => {
+  let anchorTd = null;
+  if (rangeActive && rangeCells.length && rangeCells[0].length) {
+    anchorTd = rangeCells[0][0];
+  } else if (document.activeElement && document.activeElement.tagName === 'TD') {
+    anchorTd = document.activeElement;
+  }
+
+  if (!anchorTd || anchorTd.getAttribute('contenteditable') !== 'true') return;
+
+  const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+  if (!text) return;
+
+  // Prevent default paste from dumping raw multi-line strings into a single focused <td>
+  e.preventDefault();
+
+  let lines = text.replace(/\r/g, '').split('\n');
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+
+  const grid = lines.map(line => line.split('\t'));
+  const start = cellPos(anchorTd);
+  const tbody = table.querySelector('tbody');
+  const headerRow = table.querySelector('thead tr');
+  const dataColCount = headerRow ? headerRow.querySelectorAll('th[data-col]').length : 0;
+
+  // Auto-generate extra empty rows if pasted area expands beyond current row count
+  const rowsNeeded = (start.rowIdx + grid.length) - tbody.children.length;
+  if (rowsNeeded > 0) {
+    generateEmptyRows(rowsNeeded);
+  }
+
+  const rows = tbodyRows();
+  const newlySelected = [];
+
+  grid.forEach((rowVals, r) => {
+    const tr = rows[start.rowIdx + r];
+    if (!tr) return;
+
+    const rowCellsSelected = [];
+    rowVals.forEach((val, c) => {
+      const colIdx = start.colIdx + c;
+      if (colIdx >= dataColCount) return;
+
+      const td = tr.children[colIdx];
+      if (!td || td.getAttribute('contenteditable') !== 'true') return;
+
+      const cleanVal = val.trim();
+      td.textContent = cleanVal;
+
+      saveCellFromPaste(td, cleanVal);
+      rowCellsSelected.push(td);
+    });
+    if (rowCellsSelected.length) newlySelected.push(rowCellsSelected);
+  });
+
+  if (newlySelected.length) {
+    clearRangeHighlight();
+    rangeCells = newlySelected;
+    flatRange().forEach(td => td.classList.add('range-selected'));
+    rangeActive = true;
+  }
+});
+
+// 6. USA SPENDING PULL HANDLERS
 const pullBtn = document.getElementById('pull-latest-btn');
 const pullStatus = document.getElementById('pull-status');
 
 if (pullBtn) {
   pullBtn.addEventListener('click', () => {
-    pullBtn.disabled = true;
+    if (!confirm("Are you sure you want to pull the latest data from USAspending.gov?")) return;
 
+    pullBtn.disabled = true;
     if (pullStatus) {
       pullStatus.style.display = 'block';
       pullStatus.textContent = 'Initiating background data pull...';
@@ -268,7 +533,6 @@ function pollPullStatus() {
       .then(r => r.json())
       .then(progress => {
         if (!pullStatus) return;
-
         if (progress.running) {
           pullStatus.textContent = `Pulling data: ${progress.message || 'In progress...'}`;
         } else {
@@ -284,26 +548,6 @@ function pollPullStatus() {
         pullBtn.disabled = false;
       });
   }, 2000);
-}
-</script>
-<script>
-document.getElementById("pull-latest-btn").addEventListener("click", function () {
-
-    const confirmed = confirm(
-        "Are you sure you want to pull the latest data from USAspending.gov?\n\n"
-    );
-
-    if (!confirmed) {
-        return; // User clicked Cancel
-    }
-
-    // Continue with your existing pull function here
-    pullLatestData();
-});
-
-function pullLatestData() {
-    // Your existing AJAX/fetch code goes here
-    console.log("Pulling latest data...");
 }
 </script>
 </body>

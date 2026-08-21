@@ -5,6 +5,7 @@ import secrets
 import threading
 import uuid
 from datetime import datetime, timedelta
+from db import update_cell, create_blank_row  # <--- Add create_blank_row here
 
 from dotenv import load_dotenv
 from authlib.integrations.flask_client import OAuth
@@ -969,7 +970,29 @@ def format_currency(value):
         val_float = float(clean_val)
         return f"{val_float:,.2f}"
     except (ValueError, TypeError):
-        return value    
+        return value 
+
+@app.route("/dashboard/<slug>/data/create", methods=["POST"])
+@admin_required
+def create_data_row(slug):
+    """Creates a new row in the database when a user fills in an empty auto-scrolled cell."""
+    check_slug(slug)
+    payload = request.get_json(force=True)
+    column = payload.get("column")
+    value = payload.get("value", "")
+
+    try:
+        # Create blank record in DB
+        new_id = create_blank_row(slug) 
+
+        # Update the target cell for the new row
+        derived = update_cell(slug, new_id, column, value)
+        
+        return jsonify({"ok": True, "new_id": new_id, "derived": derived})
+    except Exception as e:
+        # Prints exact database/python trace in your terminal console
+        print(f"Error creating data row: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 400
 # --------------------------------------------------------------------------
 # Application Entry Point
 # --------------------------------------------------------------------------
