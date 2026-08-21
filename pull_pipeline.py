@@ -29,8 +29,8 @@ def _init_award_tables(conn):
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS award_master (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            piid VARCHAR(150) NOT NULL,
+            id SERIAL PRIMARY KEY,
+            piid VARCHAR(150) NOT NULL UNIQUE,
             generated_internal_id VARCHAR(150),
             description TEXT,
             recipient_name VARCHAR(255),
@@ -38,13 +38,12 @@ def _init_award_tables(conn):
             base_exercised_options DECIMAL(18,2),
             base_and_all_options DECIMAL(18,2),
             status VARCHAR(30) DEFAULT 'pending',
-            fetched_at DATETIME,
-            UNIQUE KEY uniq_piid (piid)
+            fetched_at TIMESTAMP
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS award_modifications (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id SERIAL PRIMARY KEY,
             award_master_id INT NOT NULL,
             modification_number VARCHAR(50),
             action_date DATE NULL,
@@ -66,8 +65,8 @@ def _task_order_ids_for_slug(slug):
     try:
         cur = conn.cursor()
         cur.execute(
-            f"SELECT DISTINCT `award_id` FROM `{table}` "
-            f"WHERE `award_id` IS NOT NULL AND `award_id` != ''"
+            f'SELECT DISTINCT award_id FROM "{table}" '
+            f"WHERE award_id IS NOT NULL AND award_id != ''"
         )
         rows = cur.fetchall()
         cur.close()
@@ -80,10 +79,10 @@ def _upsert_award_not_found(conn, piid):
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO award_master (piid, status, fetched_at)
-        VALUES (%s, 'not_found', NOW())
-        ON DUPLICATE KEY UPDATE
+        VALUES (%s, 'not_found', CURRENT_TIMESTAMP)
+        ON CONFLICT (piid) DO UPDATE SET
             status = 'not_found',
-            fetched_at = NOW()
+            fetched_at = CURRENT_TIMESTAMP
     """, (piid,))
     conn.commit()
     cur.close()
@@ -97,16 +96,16 @@ def _save_award_data(conn, data):
             (piid, generated_internal_id, description, recipient_name,
              total_obligation, base_exercised_options, base_and_all_options,
              status, fetched_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'done', NOW())
-        ON DUPLICATE KEY UPDATE
-            generated_internal_id = VALUES(generated_internal_id),
-            description = VALUES(description),
-            recipient_name = VALUES(recipient_name),
-            total_obligation = VALUES(total_obligation),
-            base_exercised_options = VALUES(base_exercised_options),
-            base_and_all_options = VALUES(base_and_all_options),
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'done', CURRENT_TIMESTAMP)
+        ON CONFLICT (piid) DO UPDATE SET
+            generated_internal_id = EXCLUDED.generated_internal_id,
+            description = EXCLUDED.description,
+            recipient_name = EXCLUDED.recipient_name,
+            total_obligation = EXCLUDED.total_obligation,
+            base_exercised_options = EXCLUDED.base_exercised_options,
+            base_and_all_options = EXCLUDED.base_and_all_options,
             status = 'done',
-            fetched_at = NOW()
+            fetched_at = CURRENT_TIMESTAMP
     """, (
         data["piid"],
         data["generated_internal_id"],

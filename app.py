@@ -356,7 +356,7 @@ def login_google_callback():
         _establish_session(
             user_id=user["id"],
             username=user["username"],
-            email=user["email"],
+            email=user.get("email", "") if isinstance(user, dict) else "",
             is_admin=bool(user.get("is_admin", False)),
         )
     else:

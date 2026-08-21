@@ -1,23 +1,21 @@
 """
-Database connection helper for the WAMP MySQL server.
+Database connection helper for Supabase (PostgreSQL).
 
-Default WAMP MySQL settings are host=localhost, user=root, password="" (empty),
-port=3306. Edit the values below (or set environment variables) to match your
-WAMP setup if you changed the defaults.
+Default PostgreSQL settings use host, user, password, and database from 
+environment variables or fallback defaults.
 
-Each MATOC now has its OWN physical table (bids_frr, bids_navfac_me,
-bids_navfac_gu) instead of one shared table with a `matoc` column. Every
-table has a UNIQUE KEY on `folder_number` (Excel column 1), so importing the
-same Excel file twice - or importing an updated version of it - never creates
-duplicate rows: existing folder numbers get their values updated in place,
-unchanged rows are left alone, and brand-new folder numbers are inserted.
+Each MATOC has its OWN physical table (bids_frr, bids_navfac_me,
+bids_navfac_gu) registered in `matoc_config`. Tables enforce a UNIQUE constraint 
+on `folder_number` (Excel column 1) to avoid duplicate rows during imports.
 """
 import os
 import uuid
+import re
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
-import mysql.connector
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 from flask import session, request
@@ -26,10 +24,10 @@ load_dotenv()
 
 DB_CONFIG = {
     "host":     os.environ.get("DB_HOST", "localhost"),
-    "user":     os.environ.get("DB_USER", "root"),
+    "user":     os.environ.get("DB_USER", "postgres"),
     "password": os.environ.get("DB_PASSWORD", ""),
-    "database": os.environ.get("DB_NAME", "bid_intel"),
-    "port":     int(os.environ.get("DB_PORT", 3306)),
+    "database": os.environ.get("DB_NAME", "postgres"),
+    "port":     int(os.environ.get("DB_PORT", 5432)),
 }
 
 # --------------------------------------------------------------------------
@@ -48,8 +46,8 @@ _SEED_MATOCS = {
 }
 
 _BID_TABLE_DDL = """
-    id                          INT AUTO_INCREMENT PRIMARY KEY,
-    folder_number               VARCHAR(50)  NOT NULL,
+    id                          SERIAL PRIMARY KEY,
+    folder_number               VARCHAR(50)  NOT NULL UNIQUE,
     eight_a_or_r                VARCHAR(10),
     year                        VARCHAR(10),
     rfp_number                  VARCHAR(100),
@@ -57,20 +55,17 @@ _BID_TABLE_DDL = """
     title                       VARCHAR(255),
     project_type                VARCHAR(150),
     awardee                     VARCHAR(255),
-    contract_value              DECIMAL(15,2) DEFAULT 0,
-    addon_bid                   DECIMAL(15,2) DEFAULT 0,
+    contract_value              NUMERIC(15,2) DEFAULT 0,
+    addon_bid                   NUMERIC(15,2) DEFAULT 0,
     asterisk_bid                VARCHAR(10),
-    winner_price_diff_usd       DECIMAL(15,2) DEFAULT 0,
-    winner_price_diff_pct       DECIMAL(10,4) DEFAULT 0,
-    number_of_offers_received   INT DEFAULT 0,
+    winner_price_diff_usd       NUMERIC(15,2) DEFAULT 0,
+    winner_price_diff_pct       NUMERIC(10,4) DEFAULT 0,
+    number_of_offers_received   INTEGER DEFAULT 0,
     result                      VARCHAR(20),
-    mods                        DECIMAL(15,2) DEFAULT 0,
-    total                       DECIMAL(15,2) DEFAULT 0,
+    mods                        NUMERIC(15,2) DEFAULT 0,
+    total                       NUMERIC(15,2) DEFAULT 0,
     created_at                  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at                  TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uniq_folder_number (folder_number),
-    INDEX idx_project_type (project_type),
-    INDEX idx_result (result)
+    updated_at                  TIMESTAMP NULL
 """
 
 def _ensure_registry_table(conn):
@@ -88,7 +83,11 @@ def _ensure_registry_table(conn):
     if count == 0:
         for slug, (label, table_name) in _SEED_MATOCS.items():
             cur.execute(
-                "INSERT IGNORE INTO matoc_config (slug, label, table_name) VALUES (%s, %s, %s)",
+                """
+                INSERT INTO matoc_config (slug, label, table_name) 
+                VALUES (%s, %s, %s)
+                ON CONFLICT (slug) DO NOTHING
+                """,
                 (slug, label, table_name),
             )
     conn.commit()
@@ -99,13 +98,13 @@ def _ensure_registry_table(conn):
 # --------------------------------------------------------------------------
 
 def get_connection():
-    return mysql.connector.connect(**DB_CONFIG)
+    return psycopg2.connect(**DB_CONFIG)
 
 
 def get_user_by_username(username):
     conn = get_connection()
     try:
-        with conn.cursor(dictionary=True) as cursor:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute('SELECT * FROM users WHERE username = %s', (username,))
             return cursor.fetchone()
     finally:
@@ -115,8 +114,19 @@ def get_user_by_username(username):
 def get_user_by_id(user_id):
     conn = get_connection()
     try:
-        with conn.cursor(dictionary=True) as cursor:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))
+            return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def get_user_by_email(email):
+    """Checks if an email already exists in the database."""
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute("SELECT id, username FROM users WHERE email = %s", (email,))
             return cursor.fetchone()
     finally:
         conn.close()
@@ -136,28 +146,32 @@ def create_user(username, password):
         conn.close()
 
 
-def check_login(username, password):
+def register_user(username, hashed_password, email=None):
+    """Inserts a new (already-verified) user and returns their generated ID."""
     conn = get_connection()
     try:
-        with conn.cursor(dictionary=True) as cursor:
-            cursor.execute("SELECT * FROM users WHERE username = %s", (username.strip(),))
-            user = cursor.fetchone()
-
-            #print("DEBUG: DB Record =", user)
-
-            if user and check_password_hash(user['password'], password):
-                return user
-            return None
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO users (username, password, email) VALUES (%s, %s, %s) RETURNING id",
+                (username, hashed_password, email)
+            )
+            user_id = cursor.fetchone()[0]
+            conn.commit()
+            return user_id
+    except Exception as e:
+        print(f"Registration Error: {e}")
+        return None
     finally:
         conn.close()
 
-def check_login(email, password):
+
+def check_login(email_or_username, password):
     conn = get_connection()
     try:
-        with conn.cursor(dictionary=True) as cursor:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(
-                "SELECT * FROM users WHERE email = %s",
-                (email.strip().lower(),)
+                "SELECT * FROM users WHERE email = %s OR username = %s",
+                (email_or_username.strip().lower(), email_or_username.strip())
             )
             user = cursor.fetchone()
 
@@ -167,6 +181,7 @@ def check_login(email, password):
     finally:
         conn.close()
 
+
 def create_user_session(user_id, session_id, expires_at, ip_address, user_agent):
     conn = get_connection()
     cursor = conn.cursor()
@@ -175,8 +190,8 @@ def create_user_session(user_id, session_id, expires_at, ip_address, user_agent)
         INSERT INTO user_sessions
         (user_id, session_id, login_time, last_activity,
          expires_at, ip_address, user_agent, is_active)
-        VALUES (%s,%s,NOW(),NOW(),%s,%s,%s,1)
-    """,(
+        VALUES (%s, %s, NOW(), NOW(), %s, %s, %s, TRUE)
+    """, (
         user_id,
         session_id,
         expires_at,
@@ -187,6 +202,42 @@ def create_user_session(user_id, session_id, expires_at, ip_address, user_agent)
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def invalidate_user_session(session_id):
+    """Deactivates a user session in the database upon logout."""
+    if not session_id:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE user_sessions
+        SET is_active = FALSE, expires_at = NOW()
+        WHERE session_id = %s
+    """, (session_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def is_session_active(session_id):
+    """Check if the session_id exists, is marked active, and has not expired."""
+    if not session_id:
+        return False
+        
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute("""
+                SELECT id FROM user_sessions
+                WHERE session_id = %s 
+                  AND is_active = TRUE 
+                  AND expires_at > NOW()
+            """, (session_id,))
+            session_record = cursor.fetchone()
+            return bool(session_record)
+    finally:
+        conn.close()
 
 
 def handle_user_session(user):
@@ -235,7 +286,6 @@ def get_tables() -> dict:
 
 
 def _slugify(label: str) -> str:
-    import re
     s = label.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return s or "matoc"
@@ -260,7 +310,7 @@ def create_matoc(label: str) -> str:
     conn = get_connection()
     _ensure_registry_table(conn)
     cur = conn.cursor()
-    cur.execute(f"CREATE TABLE IF NOT EXISTS `{table_name}` ({_BID_TABLE_DDL})")
+    cur.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({_BID_TABLE_DDL})')
     cur.execute(
         "INSERT INTO matoc_config (slug, label, table_name) VALUES (%s, %s, %s)",
         (slug, label, table_name),
@@ -276,7 +326,7 @@ def truncate_matoc_table(slug: str):
     table = table_for(slug)
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(f"TRUNCATE TABLE `{table}`")
+    cur.execute(f'TRUNCATE TABLE "{table}"')
     conn.commit()
     cur.close()
     conn.close()
@@ -290,7 +340,7 @@ def delete_matoc(slug: str):
     _label, table = registry[slug]
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+    cur.execute(f'DROP TABLE IF EXISTS "{table}"')
     cur.execute("DELETE FROM matoc_config WHERE slug = %s", (slug,))
     conn.commit()
     cur.close()
@@ -326,11 +376,6 @@ NUMERIC_COLS = [
 
 KEY_COL = "folder_number"
 
-# Columns that, when changed, require the 3 calculated fields below to be
-# recomputed:
-#   Winner Price Difference $  = Addon Bid - Contract Value
-#   Winner Price Difference %  = (Winner Price Difference $ / Contract Value) * 100
-#   Total                      = Contract Value + Mods
 DERIVED_TRIGGER_COLS = {"contract_value", "addon_bid", "mods"}
 
 
@@ -363,66 +408,65 @@ def load_raw_dataframe_with_awards(matoc_slug: str) -> pd.DataFrame:
     table = table_for(matoc_slug)
     conn = get_connection()
 
-    # Build base bid table column list
     unique_cols = list(dict.fromkeys(COLUMN_MAP.values()))
-    bids_cols_sql = ", ".join(f"b.`{db}`" for db in unique_cols)
+    bids_cols_sql = ", ".join(f'b."{db}"' for db in unique_cols)
 
     query = f"""
         SELECT 
             b.id,
             {bids_cols_sql},
-            am.piid                                             AS `Task Order/PIID`,
-            am.recipient_name                                   AS `Recipient`,
-            am.total_obligation                                 AS `Obligation`,
-            am.base_and_all_options                             AS `Base & Options`,
-            am.base_exercised_options                           AS `Base & Exercised`,
-            am.status                                           AS `Status`,
+            am.piid                                             AS "Task Order/PIID",
+            am.recipient_name                                   AS "Recipient",
+            am.total_obligation                                 AS "Obligation",
+            am.base_and_all_options                             AS "Base & Options",
+            am.base_exercised_options                           AS "Base & Exercised",
+            am.status                                           AS "Status",
             COALESCE(
-                GROUP_CONCAT(
+                STRING_AGG(
                     CONCAT(
                         COALESCE(m.modification_number, 'Mod'), 
                         ': $', 
-                        FORMAT(COALESCE(m.federal_action_obligation, 0), 2)
-                    ) 
-                    SEPARATOR '\n'
+                        TO_CHAR(COALESCE(m.federal_action_obligation, 0), 'FM999,999,999,990.00')
+                    ), 
+                    E'\n'
                 ), 
                 'None'
-            )                                                   AS `Modifications & Values`,
-            COALESCE(SUM(m.federal_action_obligation), 0)       AS `Linked Mods Total`
-        FROM `{table}` b
-        LEFT JOIN `award_master` am 
+            )                                                   AS "Modifications & Values",
+            COALESCE(SUM(m.federal_action_obligation), 0)       AS "Linked Mods Total"
+        FROM "{table}" b
+        LEFT JOIN award_master am 
             ON TRIM(b.award_id) = TRIM(am.piid)
-        LEFT JOIN `award_modifications` m 
+        LEFT JOIN award_modifications m 
             ON am.id = m.award_master_id
-        GROUP BY b.id, am.id
+        GROUP BY b.id, am.id, am.piid, am.recipient_name, am.total_obligation, am.base_and_all_options, am.base_exercised_options, am.status
         ORDER BY b.id
     """
 
     df = pd.read_sql(query, conn)
     conn.close()
 
-    # Rename database column keys back to human-readable Excel headers
     df = df.rename(columns=DB_TO_LABEL)
     return df
+
 
 def load_matoc_dataframe(matoc_slug: str) -> pd.DataFrame:
     table = table_for(matoc_slug)
     conn = get_connection()
     query = f"""
         SELECT
-            year                        AS `Year`,
-            project_type                AS `Project Type`,
-            awardee                     AS `Awardee`,
-            contract_value              AS `Contract Value`,
-            addon_bid                   AS `Addon Bid`,
-            asterisk_bid                AS `Asterisk Bid`,
-            winner_price_diff_usd       AS `Winner Price Difference $`,
-            winner_price_diff_pct       AS `Winner Price Difference %`,
-            number_of_offers_received   AS `Number of Offers Received`,
-            result                      AS `Result`,
-            mods                        AS `Mods`,
-            total                       AS `Total`
-        FROM {table}
+            year                        AS "Year",
+            project_type                AS "Project Type",
+            awardee                     AS "Awardee",
+            contract_value              AS "Contract Value",
+            addon_bid                   AS "Addon Bid",
+            asterisk_bid                AS "Asterisk Bid",
+            winner_price_diff_usd       AS "Winner Price Difference $",
+            winner_price_diff_pct       AS "Winner Price Difference %",
+            number_of_offers_received   AS "Number of Offers Received",
+            result                      AS "Result",
+            mods                        AS "Mods",
+            total                       AS "Total"
+        FROM "{table}"
     """
     df = pd.read_sql(query, conn)
     conn.close()
@@ -433,8 +477,8 @@ def load_raw_dataframe(matoc_slug: str) -> pd.DataFrame:
     table = table_for(matoc_slug)
     conn = get_connection()
     unique_cols = list(dict.fromkeys(COLUMN_MAP.values()))
-    cols_sql = ", ".join(f"`{db}`" for db in unique_cols)
-    query = f"SELECT id, {cols_sql} FROM {table} ORDER BY id"
+    cols_sql = ", ".join(f'"{db}"' for db in unique_cols)
+    query = f'SELECT id, {cols_sql} FROM "{table}" ORDER BY id'
     df = pd.read_sql(query, conn)
     conn.close()
     df = df.rename(columns=DB_TO_LABEL)
@@ -454,23 +498,19 @@ def update_cell(matoc_slug: str, row_id: int, column_label: str, value: str):
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(f"UPDATE {table} SET `{db_col}` = %s WHERE id = %s", (value, row_id))
+    cur.execute(f'UPDATE "{table}" SET "{db_col}" = %s WHERE id = %s', (value, row_id))
 
-    # If the edited field feeds one of the calculated columns, re-read the
-    # 3 raw inputs (post-edit) and recompute/save Winner Price Difference $,
-    # Winner Price Difference %, and Total in the same request. Returned so
-    # the caller (Flask route -> browser) can patch those cells live.
     derived = None
     if db_col in DERIVED_TRIGGER_COLS:
         cur.execute(
-            f"SELECT contract_value, addon_bid, mods FROM {table} WHERE id = %s",
+            f'SELECT contract_value, addon_bid, mods FROM "{table}" WHERE id = %s',
             (row_id,),
         )
         contract_value, addon_bid, mods = cur.fetchone()
         diff_usd, diff_pct, total = _calc_derived(contract_value, addon_bid, mods)
         cur.execute(
-            f"UPDATE {table} SET winner_price_diff_usd = %s, "
-            f"winner_price_diff_pct = %s, total = %s WHERE id = %s",
+            f'UPDATE "{table}" SET winner_price_diff_usd = %s, '
+            f'winner_price_diff_pct = %s, total = %s WHERE id = %s',
             (diff_usd, diff_pct, total, row_id),
         )
         derived = {
@@ -515,10 +555,6 @@ def _clean_import_df(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().replace({"nan": ""})
 
-    # Recalculate Winner Price Difference $ / % and Total from the raw inputs
-    # instead of trusting whatever formulas/values were baked into the
-    # uploaded spreadsheet - keeps the math consistent no matter how the
-    # data got in (import vs. manual edit in the grid).
     for col in ("contract_value", "addon_bid", "mods"):
         if col not in df.columns:
             df[col] = 0.0
@@ -559,12 +595,13 @@ def upsert_dataframe(matoc_slug: str, df: pd.DataFrame) -> dict:
         and str(c).lower() != "nan"
     ]
     all_cols = [KEY_COL] + list(dict.fromkeys(db_cols))
-    col_list_sql = ", ".join(f"`{c}`" for c in all_cols)
+    col_list_sql = ", ".join(f'"{c}"' for c in all_cols)
     placeholders = ", ".join(["%s"] * len(all_cols))
-    update_sql = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in db_cols)
+    
+    update_assignments = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in db_cols)
     insert_sql = (
-        f"INSERT INTO {table} ({col_list_sql}) VALUES ({placeholders}) "
-        f"ON DUPLICATE KEY UPDATE {update_sql}"
+        f'INSERT INTO "{table}" ({col_list_sql}) VALUES ({placeholders}) '
+        f'ON CONFLICT (folder_number) DO UPDATE SET {update_assignments}'
     )
 
     for row in df.itertuples(index=False, name=None):
@@ -579,10 +616,8 @@ def upsert_dataframe(matoc_slug: str, df: pd.DataFrame) -> dict:
         cur.execute(insert_sql, values)
         if cur.rowcount == 1:
             stats["inserted"] += 1
-        elif cur.rowcount == 2:
-            stats["updated"] += 1
         else:
-            stats["unchanged"] += 1
+            stats["updated"] += 1
 
     conn.commit()
     cur.close()
@@ -591,32 +626,25 @@ def upsert_dataframe(matoc_slug: str, df: pd.DataFrame) -> dict:
 
 
 def get_modification_dataframe(matoc_slug: str) -> pd.DataFrame:
-    """One row PER MODIFICATION (not per award) - the real detail behind the
-    'Modifications & Values' summary column, joined back to the bid so you
-    still have Awardee / Project Type / Folder Number for context.
-
-    Uses INNER JOINs on purpose: this view is only about awards that actually
-    HAVE at least one modification row in the shared award_modifications table.
-    """
     table = table_for(matoc_slug)
     conn = get_connection()
     query = f"""
         SELECT
-            b.folder_number                     AS `Folder Number`,
-            b.award_id                          AS `Award/PIID`,
-            b.awardee                           AS `Awardee`,
-            b.project_type                      AS `Project Type`,
-            b.year                              AS `Year`,
-            am.total_obligation                 AS `Total Obligation`,
-            am.status                           AS `Award Status`,
-            m.modification_number               AS `Modification #`,
-            m.action_date                       AS `Action Date`,
-            m.description                       AS `Description`,
-            m.federal_action_obligation         AS `Mod Value`
-        FROM `{table}` b
-        INNER JOIN `award_master` am
+            b.folder_number                     AS "Folder Number",
+            b.award_id                          AS "Award/PIID",
+            b.awardee                           AS "Awardee",
+            b.project_type                      AS "Project Type",
+            b.year                              AS "Year",
+            am.total_obligation                 AS "Total Obligation",
+            am.status                           AS "Award Status",
+            m.modification_number               AS "Modification #",
+            m.action_date                       AS "Action Date",
+            m.description                       AS "Description",
+            m.federal_action_obligation         AS "Mod Value"
+        FROM "{table}" b
+        INNER JOIN award_master am
             ON TRIM(b.award_id) = TRIM(am.piid)
-        INNER JOIN `award_modifications` m
+        INNER JOIN award_modifications m
             ON am.id = m.award_master_id
         ORDER BY m.action_date DESC
     """
@@ -635,7 +663,7 @@ def get_contractors(matoc_slug):
     conn = get_connection()
     query = f"""
         SELECT DISTINCT awardee
-        FROM {table}
+        FROM "{table}"
         WHERE awardee IS NOT NULL
           AND awardee <> ''
         ORDER BY awardee
@@ -650,20 +678,20 @@ def get_contractor_dataframe(matoc_slug, contractor):
     conn = get_connection()
     query = f"""
         SELECT
-            year AS `Year`,
-            project_type AS `Project Type`,
-            awardee AS `Awardee`,
-            contract_value AS `Contract Value`,
-            addon_bid AS `Addon Bid`,
-            asterisk_bid AS `Asterisk Bid`,
-            winner_price_diff_usd AS `Winner Price Difference $`,
-            winner_price_diff_pct AS `Winner Price Difference %`,
-            number_of_offers_received AS `Number of Offers Received`,
-            result AS `Result`,
-            mods AS `Mods`,
-            total AS `Total`
-        FROM {table}
-        WHERE awardee=%s
+            year AS "Year",
+            project_type AS "Project Type",
+            awardee AS "Awardee",
+            contract_value AS "Contract Value",
+            addon_bid AS "Addon Bid",
+            asterisk_bid AS "Asterisk Bid",
+            winner_price_diff_usd AS "Winner Price Difference $",
+            winner_price_diff_pct AS "Winner Price Difference %",
+            number_of_offers_received AS "Number of Offers Received",
+            result AS "Result",
+            mods AS "Mods",
+            total AS "Total"
+        FROM "{table}"
+        WHERE awardee = %s
     """
     df = pd.read_sql(query, conn, params=(contractor,))
     conn.close()
@@ -674,97 +702,26 @@ def delete_row(matoc_slug: str, row_id: int):
     table = table_for(matoc_slug)
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(f"DELETE FROM {table} WHERE id = %s", (row_id,))
+    cur.execute(f'DELETE FROM "{table}" WHERE id = %s', (row_id,))
     conn.commit()
     cur.close()
     conn.close()
 
-def invalidate_user_session(session_id):
-    """Deactivates a user session in the database upon logout."""
-    if not session_id:
-        return
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE user_sessions
-        SET is_active = 0, expires_at = NOW()
-        WHERE session_id = %s
-    """, (session_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def is_session_active(session_id):
-    """Check if the session_id exists, is marked active, and has not expired."""
-    if not session_id:
-        return False
-        
-    conn = get_connection()
-    try:
-        with conn.cursor(dictionary=True) as cursor:
-            cursor.execute("""
-                SELECT id FROM user_sessions
-                WHERE session_id = %s 
-                  AND is_active = 1 
-                  AND expires_at > NOW()
-            """, (session_id,))
-            session_record = cursor.fetchone()
-            return bool(session_record)
-    finally:
-        conn.close()
-
-def get_user_by_username(username):
-    """Checks if a username already exists in the database."""
-    conn = get_connection()
-    try:
-        with conn.cursor() as cursor:
-            sql = "SELECT id, username FROM users WHERE username = %s"
-            cursor.execute(sql, (username,))
-            return cursor.fetchone()
-    finally:
-        conn.close()
-
-def get_user_by_email(email):
-    """Checks if an email already exists in the database."""
-    conn = get_connection()
-    try:
-        with conn.cursor() as cursor:
-            sql = "SELECT id, username FROM users WHERE email = %s"
-            cursor.execute(sql, (email,))
-            return cursor.fetchone()
-    finally:
-        conn.close()
 
 def create_blank_row(slug):
     """Inserts a new empty row into the database table and returns its new ID."""
-    table = table_for(slug)  # Uses your actual table lookup function
+    table = table_for(slug)
 
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Generate a temporary unique folder_number to satisfy UNIQUE KEY constraints
     temp_folder_num = f"NEW-{uuid.uuid4().hex[:8]}"
     
-    cursor.execute(f"INSERT INTO `{table}` (folder_number) VALUES (%s)", (temp_folder_num,))
-    conn.commit()
+    cursor.execute(f'INSERT INTO "{table}" (folder_number) VALUES (%s) RETURNING id', (temp_folder_num,))
+    new_id = cursor.fetchone()[0]
     
-    new_id = cursor.lastrowid
+    conn.commit()
     cursor.close()
     conn.close()
     
     return new_id
-
-def register_user(username, hashed_password, email=None):
-    """Inserts a new (already-verified) user and returns their generated ID."""
-    conn = get_connection()
-    try:
-        with conn.cursor() as cursor:
-            sql = "INSERT INTO users (username, password, email) VALUES (%s, %s, %s)"
-            cursor.execute(sql, (username, hashed_password, email))
-            conn.commit()
-            return cursor.lastrowid  # Returns the auto-incremented user ID
-    except Exception as e:
-        print(f"Registration Error: {e}")
-        return None
-    finally:
-        conn.close()
