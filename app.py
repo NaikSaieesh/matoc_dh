@@ -6,9 +6,8 @@ import threading
 import uuid
 from datetime import datetime, timedelta
 from db import update_cell, create_blank_row  # <--- Add create_blank_row here
-
+#from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
-from authlib.integrations.flask_client import OAuth
 from flask import (
     Flask,
     Response,
@@ -27,10 +26,6 @@ from werkzeug.security import generate_password_hash
 from openpyxl.styles import Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# Columns that should be rendered as US-style currency (comma thousands
-# separator + 2 decimals) both in the on-screen Raw Data view and in the
-# downloaded .xlsx export. Keep this in sync with the whitelist used in
-# templates/raw_data.html.
 CURRENCY_COLUMNS = [
     "contract value", "addon bid", "asterisk bid", "winner price difference $",
     "total", "mods", "master obligation", "master base & options",
@@ -75,7 +70,11 @@ from db import (
     load_raw_dataframe_with_awards,
     get_user_by_username,
     get_user_by_email,
-    register_user
+    register_user,
+    is_super_admin,
+    get_all_users,
+    update_user_role,
+    admin_create_user
 )
 from email_utils import send_otp_email
 
@@ -92,14 +91,14 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 # --------------------------------------------------------------------------
 # Google OAuth ("Login with Google")
 # --------------------------------------------------------------------------
-oauth = OAuth(app)
-google_oauth = oauth.register(
-    name="google",
-    client_id=os.environ.get("GOOGLE_CLIENT_ID"),
-    client_secret=os.environ.get("GOOGLE_CLIENT_SECRET"),
-    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={"scope": "openid email profile"},
-)
+# oauth = OAuth(app)
+# google_oauth = oauth.register(
+#     name="google",
+#     client_id=os.environ.get("GOOGLE_CLIENT_ID"),
+#     client_secret=os.environ.get("GOOGLE_CLIENT_SECRET"),
+#     server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+#     client_kwargs={"scope": "openid email profile"},
+# )
 
 
 # --------------------------------------------------------------------------
@@ -130,6 +129,15 @@ def admin_required(view):
         return view(*args, **kwargs)
     return wrapped
 
+def super_admin_required(view):
+    """Ensure user is authenticated with super admin privileges."""
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not is_super_admin():
+            flash("Unauthorized access: Only Super Admins can upload Excel files.")
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+    return wrapped
 
 def check_slug(slug):
     """Verify that a MATOC slug exists, else abort with 404."""
@@ -153,7 +161,8 @@ def check_session_validity():
     If missing or inactive, forces logout."""
     
     # Skip check for static files and the login route to avoid infinite redirects
-    if request.endpoint in ("login", "static", "login_google", "login_google_callback"):
+    #if request.endpoint in ("login", "static", "login_google", "login_google_callback"):
+    if request.endpoint in ("login", "static"):
         return
 
     # Check if the user claims to be logged in
@@ -166,142 +175,142 @@ def check_session_validity():
             flash("Your session has expired or is invalid. Please log in again.")
             return redirect(url_for("login"))
 
-def _generate_otp() -> str:
-    """Generates a cryptographically-random 6 digit OTP."""
-    return f"{secrets.randbelow(1_000_000):06d}"
+# def _generate_otp() -> str:
+#     """Generates a cryptographically-random 6 digit OTP."""
+#     return f"{secrets.randbelow(1_000_000):06d}"
 
 
-def _send_registration_otp():
-    """(Re)generates an OTP for the pending registration in the session and
-    emails it via SendGrid. Returns (success, message)."""
-    pending = session.get("pending_registration")
-    if not pending:
-        return False, "No pending registration found."
+# def _send_registration_otp():
+#     """(Re)generates an OTP for the pending registration in the session and
+#     emails it via SendGrid. Returns (success, message)."""
+#     pending = session.get("pending_registration")
+#     if not pending:
+#         return False, "No pending registration found."
 
-    otp = _generate_otp()
-    pending["otp"] = otp
-    pending["otp_expires_at"] = (datetime.now() + timedelta(minutes=10)).isoformat()
-    session["pending_registration"] = pending
+#     otp = _generate_otp()
+#     pending["otp"] = otp
+#     pending["otp_expires_at"] = (datetime.now() + timedelta(minutes=10)).isoformat()
+#     session["pending_registration"] = pending
 
-    ok, msg = send_otp_email(pending["email"], otp, pending["username"])
-    return ok, msg
+#     ok, msg = send_otp_email(pending["email"], otp, pending["username"])
+#     return ok, msg
 
 
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    # If already logged in, redirect home
-    if session.get("logged_in"):
-        return redirect(url_for("index"))
+# @app.route("/register", methods=["GET", "POST"])
+# def register():
+#     # If already logged in, redirect home
+#     if session.get("logged_in"):
+#         return redirect(url_for("index"))
 
-    next_url = request.args.get("next") or request.form.get("next") or url_for("index")
-    error = None
+#     next_url = request.args.get("next") or request.form.get("next") or url_for("index")
+#     error = None
 
-    if request.method == "POST":
-        stage = request.form.get("stage", "register")
+#     if request.method == "POST":
+#         stage = request.form.get("stage", "register")
 
-        # ------------------------------------------------------------
-        # Stage 1: collect username/email/password, send OTP to email
-        # ------------------------------------------------------------
-        if stage == "register":
-            username = request.form.get("username", "").strip()
-            email = request.form.get("email", "").strip().lower()
-            password = request.form.get("password", "")
+#         # ------------------------------------------------------------
+#         # Stage 1: collect username/email/password, send OTP to email
+#         # ------------------------------------------------------------
+#         if stage == "register":
+#             username = request.form.get("username", "").strip()
+#             email = request.form.get("email", "").strip().lower()
+#             password = request.form.get("password", "")
 
-            if not username or not email or not password:
-                error = "Username, email and password are required."
-            elif get_user_by_username(username):
-                error = "Username is already taken. Please choose another."
-            elif get_user_by_email(email):
-                error = "An account with that email already exists."
-            else:
-                session["pending_registration"] = {
-                    "username": username,
-                    "email": email,
-                    "password_hash": generate_password_hash(password),
-                }
-                ok, msg = _send_registration_otp()
-                if ok:
-                    flash(f"We sent a verification code to {email}.")
-                else:
-                    session.pop("pending_registration", None)
-                    error = f"Could not send verification email: {msg}"
+#             if not username or not email or not password:
+#                 error = "Username, email and password are required."
+#             elif get_user_by_username(username):
+#                 error = "Username is already taken. Please choose another."
+#             elif get_user_by_email(email):
+#                 error = "An account with that email already exists."
+#             else:
+#                 session["pending_registration"] = {
+#                     "username": username,
+#                     "email": email,
+#                     "password_hash": generate_password_hash(password),
+#                 }
+#                 ok, msg = _send_registration_otp()
+#                 if ok:
+#                     flash(f"We sent a verification code to {email}.")
+#                 else:
+#                     session.pop("pending_registration", None)
+#                     error = f"Could not send verification email: {msg}"
 
-            if error:
-                flash(error)
+#             if error:
+#                 flash(error)
 
-        # ------------------------------------------------------------
-        # Stage 2: resend the OTP
-        # ------------------------------------------------------------
-        elif stage == "resend":
-            ok, msg = _send_registration_otp()
-            if ok:
-                flash("A new verification code has been sent.")
-            else:
-                flash(f"Could not resend code: {msg}")
+#         # ------------------------------------------------------------
+#         # Stage 2: resend the OTP
+#         # ------------------------------------------------------------
+#         elif stage == "resend":
+#             ok, msg = _send_registration_otp()
+#             if ok:
+#                 flash("A new verification code has been sent.")
+#             else:
+#                 flash(f"Could not resend code: {msg}")
 
-        # ------------------------------------------------------------
-        # Stage 3: verify OTP, create the account, auto-login
-        # ------------------------------------------------------------
-        elif stage == "verify":
-            pending = session.get("pending_registration")
-            entered_otp = request.form.get("otp", "").strip()
+#         # ------------------------------------------------------------
+#         # Stage 3: verify OTP, create the account, auto-login
+#         # ------------------------------------------------------------
+#         elif stage == "verify":
+#             pending = session.get("pending_registration")
+#             entered_otp = request.form.get("otp", "").strip()
 
-            if not pending:
-                error = "Your registration session expired. Please start again."
-            elif datetime.now() > datetime.fromisoformat(pending["otp_expires_at"]):
-                error = "That code has expired. Please request a new one."
-            elif entered_otp != pending.get("otp"):
-                error = "Incorrect verification code. Please try again."
-            else:
-                user_id = register_user(
-                    pending["username"], pending["password_hash"], pending["email"]
-                )
-                if user_id:
-                    session.pop("pending_registration", None)
+#             if not pending:
+#                 error = "Your registration session expired. Please start again."
+#             elif datetime.now() > datetime.fromisoformat(pending["otp_expires_at"]):
+#                 error = "That code has expired. Please request a new one."
+#             elif entered_otp != pending.get("otp"):
+#                 error = "Incorrect verification code. Please try again."
+#             else:
+#                 user_id = register_user(
+#                     pending["username"], pending["password_hash"], pending["email"]
+#                 )
+#                 if user_id:
+#                     session.pop("pending_registration", None)
 
-                    session.permanent = True
-                    session["logged_in"] = True
-                    session["username"] = pending["username"]
-                    session["user_id"] = user_id
-                    session["is_admin"] = False
+#                     session.permanent = True
+#                     session["logged_in"] = True
+#                     session["username"] = pending["username"]
+#                     session["user_id"] = user_id
+#                     session["is_admin"] = False
 
-                    session_uuid = str(uuid.uuid4())
-                    session["session_id"] = session_uuid
-                    expires_at = datetime.now() + timedelta(minutes=45)
+#                     session_uuid = str(uuid.uuid4())
+#                     session["session_id"] = session_uuid
+#                     expires_at = datetime.now() + timedelta(minutes=45)
 
-                    create_user_session(
-                        user_id=user_id,
-                        session_id=session_uuid,
-                        expires_at=expires_at,
-                        ip_address=request.remote_addr,
-                        user_agent=request.headers.get("User-Agent")
-                    )
+#                     create_user_session(
+#                         user_id=user_id,
+#                         session_id=session_uuid,
+#                         expires_at=expires_at,
+#                         ip_address=request.remote_addr,
+#                         user_agent=request.headers.get("User-Agent")
+#                     )
 
-                    flash("Account created successfully!")
-                    return redirect(next_url)
-                else:
-                    error = "Failed to create account. Please try again."
+#                     flash("Account created successfully!")
+#                     return redirect(next_url)
+#                 else:
+#                     error = "Failed to create account. Please try again."
 
-            if error:
-                flash(error)
+#             if error:
+#                 flash(error)
 
-    return render_template(
-        "register_main.html",
-        error=error,
-        next_url=next_url,
-        awaiting_otp=bool(session.get("pending_registration")),
-        pending_email=(session.get("pending_registration") or {}).get("email"),
-    )
+#     return render_template(
+#         "register_main.html",
+#         error=error,
+#         next_url=next_url,
+#         awaiting_otp=bool(session.get("pending_registration")),
+#         pending_email=(session.get("pending_registration") or {}).get("email"),
+#     )
 
-def _establish_session(user_id, username, email, is_admin=False):
-    """Sets Flask session keys + creates a DB-tracked session row.
-    Shared by password login, registration, and Google OAuth login."""
+def _establish_session(user_id, username, email, is_admin=False, is_super_admin=False):
+    """Sets Flask session keys + creates a DB-tracked session row."""
     session.permanent = True
     session["logged_in"] = True
     session["username"] = username
     session["email"] = email
     session["user_id"] = user_id
     session["is_admin"] = bool(is_admin)
+    session["is_super_admin"] = bool(is_super_admin)  # <-- ADD THIS
 
     session_uuid = str(uuid.uuid4())
     session["session_id"] = session_uuid
@@ -316,78 +325,77 @@ def _establish_session(user_id, username, email, is_admin=False):
     )
 
 
-@app.route("/login/google")
-def login_google():
-    """Kicks off the Google OAuth redirect."""
-    if session.get("logged_in"):
-        return redirect(url_for("index"))
+# @app.route("/login/google")
+# def login_google():
+#     """Kicks off the Google OAuth redirect."""
+#     if session.get("logged_in"):
+#         return redirect(url_for("index"))
 
-    next_url = request.args.get("next") or url_for("index")
-    session["oauth_next"] = next_url
-    redirect_uri = url_for("login_google_callback", _external=True)
-    return google_oauth.authorize_redirect(redirect_uri)
+#     next_url = request.args.get("next") or url_for("index")
+#     session["oauth_next"] = next_url
+#     redirect_uri = url_for("login_google_callback", _external=True)
+#     return google_oauth.authorize_redirect(redirect_uri)
 
 
-@app.route("/login/google/callback")
-def login_google_callback():
-    """Handles Google's redirect back, finds-or-creates the user, logs them in."""
-    next_url = session.pop("oauth_next", None) or url_for("index")
+# @app.route("/login/google/callback")
+# def login_google_callback():
+#     """Handles Google's redirect back, finds-or-creates the user, logs them in."""
+#     next_url = session.pop("oauth_next", None) or url_for("index")
 
-    try:
-        token = google_oauth.authorize_access_token()
-        userinfo = token.get("userinfo")
-        if not userinfo:
-            userinfo = google_oauth.parse_id_token(token)
-    except Exception as e:
-        flash(f"Google sign-in failed: {e}")
-        return redirect(url_for("login"))
+#     try:
+#         token = google_oauth.authorize_access_token()
+#         userinfo = token.get("userinfo")
+#         if not userinfo:
+#             userinfo = google_oauth.parse_id_token(token)
+#     except Exception as e:
+#         flash(f"Google sign-in failed: {e}")
+#         return redirect(url_for("login"))
 
-    email = (userinfo.get("email") or "").strip().lower()
-    if not email:
-        flash("Google did not return an email address for this account.")
-        return redirect(url_for("login"))
-    if not userinfo.get("email_verified", True):
-        flash("Please use a verified Google email address.")
-        return redirect(url_for("login"))
+#     email = (userinfo.get("email") or "").strip().lower()
+#     if not email:
+#         flash("Google did not return an email address for this account.")
+#         return redirect(url_for("login"))
+#     if not userinfo.get("email_verified", True):
+#         flash("Please use a verified Google email address.")
+#         return redirect(url_for("login"))
 
-    user = get_user_by_email(email)
+#     user = get_user_by_email(email)
 
-    if user:
-        _establish_session(
-            user_id=user["id"],
-            username=user["username"],
-            email=user.get("email", "") if isinstance(user, dict) else "",
-            is_admin=bool(user.get("is_admin", False)),
-        )
-    else:
-        # First time this Google account has signed in -> auto-register.
-        base_username = (userinfo.get("name") or email.split("@")[0]).strip()
-        base_username = base_username.replace(" ", "_") or "user"
-        username = base_username
-        suffix = 1
-        while get_user_by_username(username):
-            suffix += 1
-            username = f"{base_username}{suffix}"
+#     if user:
+#         _establish_session(
+#             user_id=user["id"],
+#             username=user["username"],
+#             email=user["email"],
+#             is_admin=bool(user.get("is_admin", False)),
+#         )
+#     else:
+#         # First time this Google account has signed in -> auto-register.
+#         base_username = (userinfo.get("name") or email.split("@")[0]).strip()
+#         base_username = base_username.replace(" ", "_") or "user"
+#         username = base_username
+#         suffix = 1
+#         while get_user_by_username(username):
+#             suffix += 1
+#             username = f"{base_username}{suffix}"
 
-        # Google-authenticated accounts don't have a usable local password;
-        # store an unguessable random hash so password login is a no-op.
-        unusable_hash = generate_password_hash(secrets.token_hex(32))
-        user_id = register_user(username, unusable_hash, email)
+#         # Google-authenticated accounts don't have a usable local password;
+#         # store an unguessable random hash so password login is a no-op.
+#         unusable_hash = generate_password_hash(secrets.token_hex(32))
+#         user_id = register_user(username, unusable_hash, email)
 
-        if not user_id:
-            flash("Could not create an account for that Google login. Please try again.")
-            return redirect(url_for("login"))
+#         if not user_id:
+#             flash("Could not create an account for that Google login. Please try again.")
+#             return redirect(url_for("login"))
 
-        _establish_session(user_id=user_id, username=username, email=email, is_admin=False)
-        flash("Account created via Google sign-in.")
+#         _establish_session(user_id=user_id, username=username, email=email, is_admin=False)
+#         flash("Account created via Google sign-in.")
 
-    return redirect(next_url)
+#     return redirect(next_url)
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
 
-    # Already logged in
     if session.get("logged_in"):
         return redirect(url_for("index"))
 
@@ -399,27 +407,22 @@ def login():
         email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
 
-        # Authenticate from database
         user = check_login(email, password) if email else None
 
         if user:
 
-            # Flask session
             session.permanent = True
             session["logged_in"] = True
             session["username"] = user["username"]
             session["email"] = user["email"]
             session["user_id"] = user["id"]
             session["is_admin"] = bool(user.get("is_admin", False))
+            session["is_super_admin"] = bool(user.get("is_super_admin", False)) # <-- ADD THIS
 
-            # Generate unique session ID
             session_uuid = str(uuid.uuid4())
             session["session_id"] = session_uuid
-
-            # Session expires in 45 minutes
             expires_at = datetime.now() + timedelta(minutes=45)
 
-            # Save session in database
             create_user_session(
                 user_id=user["id"],
                 session_id=session_uuid,
@@ -438,10 +441,10 @@ def login():
             session["username"] = "admin"
             session["user_id"] = 0
             session["is_admin"] = True
+            session["is_super_admin"] = True # <-- ADD THIS FOR FALLBACK ADMIN
 
             session_uuid = str(uuid.uuid4())
             session["session_id"] = session_uuid
-
             expires_at = datetime.now() + timedelta(minutes=45)
 
             create_user_session(
@@ -538,12 +541,10 @@ def raw_data(slug):
     """Shows every row/column for this MATOC, including linked award info."""
     check_slug(slug)
 
-    # Use the new joined function instead of load_raw_dataframe
     df = load_raw_dataframe_with_awards(slug)
 
-    # Automatically includes the new columns in the grid
     columns = list(df.columns)
-    columns.remove("id")  # Hide internal DB ID from grid header
+    columns.remove("id")
 
     rows = df.to_dict(orient="records")
     return render_template(
@@ -553,6 +554,7 @@ def raw_data(slug):
         columns=columns,
         rows=rows,
         is_admin=is_admin(),
+        is_super_admin=is_super_admin(),  # <-- ADD THIS
         message=request.args.get("message"),
     )
 
@@ -638,33 +640,38 @@ def export_raw_data(slug):
         download_name=filename,
     )
 
-
 @app.route("/dashboard/<slug>/data/update", methods=["POST"])
-@admin_required
+@login_required
 def update_data(slug):
-    """AJAX endpoint used by the editable grid to save one cell."""
     check_slug(slug)
-    payload = request.get_json(force=True)
+    payload = request.get_json(force=True) or {}
     row_id = payload.get("id")
     column = payload.get("column")
     value = payload.get("value", "")
+
+    if not is_admin() and column != "Project Type":
+        return jsonify({"ok": False, "error": "Unauthorized to edit this column."}), 403
+
     try:
+        # Removed user_id parameter
         derived = update_cell(slug, row_id, column, value)
-        return {"ok": True, "derived": derived}
+        return jsonify({"ok": True, "derived": derived})
     except Exception as e:
-        return {"ok": False, "error": str(e)}, 400
+        print(f"[Error in update_data]: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @app.route("/dashboard/<slug>/data/delete/<int:row_id>", methods=["POST"])
 @admin_required
 def delete_data_row(slug, row_id):
     check_slug(slug)
+    # Removed user_id parameter
     delete_row(slug, row_id)
     return redirect(url_for("raw_data", slug=slug, message="Row deleted."))
 
 
 @app.route("/dashboard/<slug>/data/upload", methods=["POST"])
-@admin_required
+@super_admin_required  # Restrict upload permission to Super Admin only
 def upload_data(slug):
     """Import/refresh this MATOC's data from an uploaded Excel file."""
     check_slug(slug)
@@ -800,23 +807,36 @@ def modification_intelligence(slug):
         detail=detail,
     )
 
-
-# --------------------------------------------------------------------------
-# Admin Operations
-# --------------------------------------------------------------------------
-
 @app.route("/admin")
 @admin_required
 def admin_dashboard():
     matocs = get_matocs()
+    users = get_all_users()
     return render_template(
         "admin.html",
         matocs=matocs,
-        active_tab="overview",
+        users=users,
+        is_super_admin=is_super_admin(),
         message=request.args.get("message"),
         error=request.args.get("error"),
     )
 
+# New route to toggle roles (Super Admin restricted)
+@app.route("/admin/user/<int:user_id>/role", methods=["POST"])
+@super_admin_required
+def admin_update_user_role(user_id):
+    is_admin_flag = bool(request.form.get("is_admin"))
+    is_super_admin_flag = bool(request.form.get("is_super_admin"))
+
+    # Prevent a super admin from accidentally revoking their own super admin status
+    if user_id == session.get("user_id") and not is_super_admin_flag:
+        return redirect(url_for("admin_dashboard", error="You cannot remove your own Super Admin privileges."))
+
+    try:
+        update_user_role(user_id, is_admin_flag, is_super_admin_flag)
+        return redirect(url_for("admin_dashboard", message="User role updated successfully."))
+    except Exception as e:
+        return redirect(url_for("admin_dashboard", error=f"Could not update user role: {e}"))
 
 @app.route("/admin/matoc/create", methods=["POST"])
 @admin_required
@@ -831,6 +851,29 @@ def admin_create_matoc():
         return redirect(url_for("admin_dashboard", error=f"Could not create MATOC: {e}"))
 
 
+@app.route("/admin/user/create", methods=["POST"])
+@admin_required
+def admin_add_user():
+    username = request.form.get("username", "").strip()
+    email = request.form.get("email", "").strip().lower()
+    password = request.form.get("password", "")
+
+    if not username or not password:
+        return redirect(url_for("admin_dashboard", error="Username and password are required."))
+
+    if get_user_by_username(username):
+        return redirect(url_for("admin_dashboard", error="Username is already taken."))
+
+    if email and get_user_by_email(email):
+        return redirect(url_for("admin_dashboard", error="Email is already registered."))
+
+    user_id = admin_create_user(username, email, password)
+    if user_id:
+        return redirect(url_for("admin_dashboard", message=f"User '{username}' created successfully."))
+    else:
+        return redirect(url_for("admin_dashboard", error="Failed to create user."))
+
+    
 @app.route("/admin/matoc/<slug>/truncate", methods=["POST"])
 @admin_required
 def admin_truncate_matoc(slug):
@@ -858,90 +901,6 @@ def admin_delete_matoc(slug):
     except Exception as e:
         return redirect(url_for("admin_dashboard", error=f"Could not delete '{label}': {e}"))
 
-
-# --------------------------------------------------------------------------
-# Admin Code Editor
-# --------------------------------------------------------------------------
-
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-EDITABLE_EXTENSIONS = {".py", ".html", ".css", ".js", ".sql", ".txt", ".md"}
-EXCLUDED_DIRS = {"__pycache__", ".git", "venv", ".venv", "node_modules"}
-
-
-def _safe_project_path(rel_path):
-    """Resolves rel_path under PROJECT_ROOT and blocks path-traversal attempts."""
-    candidate = os.path.abspath(os.path.join(PROJECT_ROOT, rel_path))
-    if not (candidate == PROJECT_ROOT or candidate.startswith(PROJECT_ROOT + os.sep)):
-        raise ValueError("Path is outside the project folder.")
-    _, ext = os.path.splitext(candidate)
-    if ext.lower() not in EDITABLE_EXTENSIONS:
-        raise ValueError(f"'{ext}' files can't be edited here.")
-    return candidate
-
-
-def _list_editable_files():
-    files = []
-    for root, dirs, filenames in os.walk(PROJECT_ROOT):
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
-        for fn in filenames:
-            _, ext = os.path.splitext(fn)
-            if ext.lower() in EDITABLE_EXTENSIONS:
-                full = os.path.join(root, fn)
-                rel = os.path.relpath(full, PROJECT_ROOT).replace(os.sep, "/")
-                files.append(rel)
-    return sorted(files)
-
-
-@app.route("/admin/editor")
-@admin_required
-def admin_editor():
-    matocs = get_matocs()
-    files = _list_editable_files()
-    selected = request.args.get("file") or (files[0] if files else "")
-    content = ""
-    if selected:
-        try:
-            path = _safe_project_path(selected)
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            content = f"# Could not read file: {e}"
-    return render_template(
-        "admin.html",
-        matocs=matocs,
-        active_tab="editor",
-        files=files,
-        selected_file=selected,
-        file_content=content,
-        message=request.args.get("message"),
-        error=request.args.get("error"),
-    )
-
-
-@app.route("/admin/editor/save", methods=["POST"])
-@admin_required
-def admin_editor_save():
-    rel_path = request.form.get("file", "")
-    content = request.form.get("content", "")
-    try:
-        path = _safe_project_path(rel_path)
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                original = f.read()
-            with open(path + ".bak", "w", encoding="utf-8") as f:
-                f.write(original)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        note = ""
-        if rel_path.endswith(".py"):
-            note = (
-                " Python file saved - the dev server will auto-reload in a few seconds."
-            )
-        return redirect(
-            url_for("admin_editor", file=rel_path, message=f"Saved {rel_path}." + note)
-        )
-    except Exception as e:
-        return redirect(url_for("admin_editor", file=rel_path, error=f"Save failed: {e}"))
 
 @app.template_filter('usd')
 def usd_format(value, col_name=""):
@@ -972,31 +931,53 @@ def format_currency(value):
     except (ValueError, TypeError):
         return value 
 
+# @app.route("/dashboard/<slug>/data/create", methods=["POST"])
+# @admin_required
+# def create_data_row(slug):
+#     """Creates a new row in the database when a user fills in an empty auto-scrolled cell."""
+#     check_slug(slug)
+#     payload = request.get_json(force=True)
+#     column = payload.get("column")
+#     value = payload.get("value", "")
+
+#     try:
+#         # Create blank record in DB
+#         new_id = create_blank_row(slug) 
+
+#         # Update the target cell for the new row
+#         derived = update_cell(slug, new_id, column, value)
+        
+#         return jsonify({"ok": True, "new_id": new_id, "derived": derived})
+#     except Exception as e:
+#         # Prints exact database/python trace in your terminal console
+#         print(f"Error creating data row: {e}")
+#         return jsonify({"ok": False, "error": str(e)}), 400
+
 @app.route("/dashboard/<slug>/data/create", methods=["POST"])
 @admin_required
 def create_data_row(slug):
-    """Creates a new row in the database when a user fills in an empty auto-scrolled cell."""
     check_slug(slug)
     payload = request.get_json(force=True)
     column = payload.get("column")
     value = payload.get("value", "")
 
     try:
-        # Create blank record in DB
+        # Removed user_id parameters
         new_id = create_blank_row(slug) 
-
-        # Update the target cell for the new row
         derived = update_cell(slug, new_id, column, value)
-        
         return jsonify({"ok": True, "new_id": new_id, "derived": derived})
     except Exception as e:
-        # Prints exact database/python trace in your terminal console
         print(f"Error creating data row: {e}")
         return jsonify({"ok": False, "error": str(e)}), 400
 # --------------------------------------------------------------------------
 # Application Entry Point
 # --------------------------------------------------------------------------
 
+# if __name__ == "__main__":
+#     port = int(os.environ.get("PORT", 5000))
+#     app.run(host="0.0.0.0", port=port, debug=False)
+
 if __name__ == "__main__":
+    host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host=host, port=port, debug=False)

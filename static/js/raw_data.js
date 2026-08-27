@@ -21,9 +21,9 @@ function cellPos(td) {
 function bindCellEditing(td) {
   let original = td.textContent;
   td.addEventListener('focus', () => { 
-    original = td.textContent.trim().replace(/[$,\s]/g, "");
-    td.textContent = original;
-  });
+  original = td.textContent.trim().replace(/[$,]/g, "");
+  td.textContent = original;
+});
   
   td.addEventListener('blur', () => {
     const value = td.textContent.trim();

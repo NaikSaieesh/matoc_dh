@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ matoc_label }} - Raw Data</title>
+
 <link rel="stylesheet" href="{{ url_for('static', filename='css/raw_data.css') }}">
 </head>
 <body>
@@ -11,8 +12,11 @@
   <h1>{{ matoc_label }} - Raw Data</h1>
   <p class="sub">
     {{ rows|length }} row{{ 's' if rows|length != 1 else '' }}.
-    {% if is_admin %}You're logged in as admin - cells below are editable, click into one and press Tab/Enter or click away to save.
-    {% else %}Read-only view. <a class="backlink" href="{{ url_for('login', next=request.path) }}">Log in as admin</a> to edit or import data.{% endif %}
+    {% if is_admin %}
+      You're logged in as admin - cells below are editable. Click into one and press Tab/Enter or click away to save.
+    {% else %}
+      Standard user view - <strong>Project Type</strong> is editable. Click into a Project Type cell to edit and save.
+    {% endif %}
   </p>
 
   {% if message %}<div class="message">{{ message }}</div>{% endif %}
@@ -37,7 +41,7 @@
     {% endif %}
   </div>
 
-  {% if is_admin %}
+  {% if session.get('is_super_admin') %}
   <div id="pull-status" class="message" style="display:none; background:#132133; border-color:#1F6FEB; color:#79B8FF;"></div>
 
   <div class="upload-panel">
@@ -63,7 +67,7 @@
         {% for row in rows %}
         <tr data-id="{{ row['id'] }}">
           {% for col in columns %}
-          <td {% if is_admin %}contenteditable="true"{% endif %} data-column="{{ col }}">
+          <td {% if is_admin or col == 'Project Type' %}contenteditable="true"{% endif %} data-column="{{ col }}">
             {% if col.lower() in ['contract value', 'addon bid', 'asterisk bid', 'winner price difference $', 'total', 'mods', 'obligation','base & options','base & exercised','linked mods total'] %}
               {{ row[col]|format_currency }}
             {% else %}

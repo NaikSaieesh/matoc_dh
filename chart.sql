@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS `award_master` (
   `base_and_all_options` decimal(18,2) DEFAULT NULL,
   `status` varchar(30) DEFAULT 'pending',
   `fetched_at` datetime DEFAULT NULL,
-  PRIMARY KEY (`id`),Q
+  PRIMARY KEY (`id`),
   UNIQUE KEY `uniq_piid` (`piid`)
 ) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
@@ -97,6 +97,14 @@ CREATE TABLE IF NOT EXISTS `users` (
 -- --------------------------------------------------------
 
 --
+-- Dumping data for table `users`
+--
+
+INSERT INTO `users` (`id`, `username`, `email`, `password`, `created_at`, `is_admin`, `is_super_admin`) VALUES
+(1, 'Saieesh', 'saieeshnaik25@gmail.com', 'scrypt:32768:8:1$dWW38mQf1qPyGIta$3b77741db6a4d8cdac148a6109499312a65d01096a979b4b27dfda9217ddc1054e837e769849cd81fbe3efea0c9c2d930dbe3e48cc724e01f5bdfed9c0d98bde', '2026-07-27 20:40:08', 1, 1),
+COMMIT;
+
+--
 -- Table structure for table `user_sessions`
 --
 
@@ -117,3 +125,5 @@ COMMIT;
 /*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
 /*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
+
+ALTER TABLE users ADD COLUMN is_super_admin TINYINT(1) DEFAULT 0;
