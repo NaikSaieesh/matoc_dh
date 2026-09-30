@@ -1,0 +1,6 @@
+{
+  "name": "MATOC Contract & Database Intelligence Platform",
+  "description": "Executive MATOC bid intelligence, database connection & SQL extraction studio, live USAspending.gov modification sync, and interactive spreadsheet analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
