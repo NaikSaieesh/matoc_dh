@@ -252,6 +252,7 @@ async function initEmbeddedSqlite() {
   }
 
   // Ensure initial user from Schema.sql exists
+  /*
   const userCheck = sqliteDb.exec("SELECT COUNT(*) FROM users WHERE email = 'saieeshnaik25@gmail.com'");
   const userCount = Number(userCheck[0]?.values?.[0]?.[0] || 0);
   if (userCount === 0) {
@@ -269,6 +270,7 @@ async function initEmbeddedSqlite() {
       ]
     );
   }
+    */
 
   saveSqliteToDisk();
   return sqliteDb;
