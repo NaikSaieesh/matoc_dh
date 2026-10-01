@@ -42,7 +42,16 @@ interface UserSession {
 export default function App() {
   const [user, setUser] = useState<UserSession | null>(null);
 
-  const [view, setView] = useState<ViewState>({ page: "home" });
+    // Start on the login page. The dashboard is only shown after a successful login.
+  const [view, setView] = useState<ViewState>({ page: "login" });
+
+  // Auth guard: if nobody is logged in, always show the login page
+  useEffect(() => {
+    if (!user && view.page !== "login") {
+      setView({ page: "login" });
+    }
+  }, [user, view.page]);
+  
   const [categories, setCategories] = useState<
     Array<{ key: string; label: string; desc: string; count: number }>
   >([
