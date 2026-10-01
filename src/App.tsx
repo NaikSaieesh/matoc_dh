@@ -40,22 +40,7 @@ interface UserSession {
 }
 
 export default function App() {
-  // Default session seeded from Schema.sql Super Admin user (Saieesh) so all workflows work immediately, with full Login/Logout support
-  const [user, setUser] = useState<UserSession | null>(() => {
-    try {
-      const saved = localStorage.getItem("matoc_session_user");
-      if (saved) return JSON.parse(saved);
-    } catch {
-      // ignore
-    }
-    return {
-      id: 1,
-      username: "Saieesh",
-      email: "saieeshnaik25@gmail.com",
-      is_admin: true,
-      is_super_admin: true,
-    };
-  });
+  const [user, setUser] = useState<UserSession | null>(null);
 
   const [view, setView] = useState<ViewState>({ page: "home" });
   const [categories, setCategories] = useState<
