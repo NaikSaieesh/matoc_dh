@@ -38,8 +38,14 @@ import {
   configureMysqlConnection,
   executeSqlQuery,
   importSqlDump,
+  getReason,
+  saveDebrief,
+  claimAiRun,
+  saveAiResult,
+  markAiFailed,
 } from "./server/db.ts";
 import { classifyProject, classifyProjectType, PROJECT_TYPES } from "./server/classifier.ts";
+import { generateReasonAnalysis } from "./server/groq.ts";
 import { fetchAwardData } from "./server/usaspending.ts";
 import {
   buildDashboardAnalytics,
