@@ -2138,3 +2138,49 @@ export async function importSqlDump(sqlContent: string): Promise<{
     errors,
   };
 }
+
+export async function getReason(folder: string) {
+  if (engineMode === "mysql" && mysqlPool) {
+    const [r]: any = await mysqlPool.query("SELECT * FROM reason_ai WHERE folder_number=?", [folder]);
+    return r?.[0] || null;
+  }
+  return sqliteQueryRows("SELECT * FROM reason_ai WHERE folder_number=?", [folder])[0] || null;
+}
+
+export async function saveDebrief(d: any) {
+  const delta = d.winning_bid_price
+    ? Math.round(((d.your_bid_price - d.winning_bid_price) / d.winning_bid_price) * 10000) / 100
+    : null;
+  const vals = [d.folder_number, d.matoc_category || "construction-management",
+    d.price_factor_pct, d.technical_factor_pct, d.past_performance_pct,
+    d.your_bid_price, d.winning_bid_price, delta, d.raw_debrief_notes];
+  if (engineMode === "mysql" && mysqlPool) {
+    await mysqlPool.query(`INSERT INTO reason_ai (folder_number,matoc_category,price_factor_pct,technical_factor_pct,past_performance_pct,your_bid_price,winning_bid_price,price_delta_pct,raw_debrief_notes)
+      VALUES (?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE matoc_category=VALUES(matoc_category),price_factor_pct=VALUES(price_factor_pct),technical_factor_pct=VALUES(technical_factor_pct),past_performance_pct=VALUES(past_performance_pct),your_bid_price=VALUES(your_bid_price),winning_bid_price=VALUES(winning_bid_price),price_delta_pct=VALUES(price_delta_pct),raw_debrief_notes=VALUES(raw_debrief_notes)`, vals);
+  } else {
+    sqliteRun(`INSERT OR REPLACE INTO reason_ai (folder_number,matoc_category,price_factor_pct,technical_factor_pct,past_performance_pct,your_bid_price,winning_bid_price,price_delta_pct,raw_debrief_notes,ai_summary,ai_recommendation,ai_status,ai_generated_at)
+      SELECT ?,?,?,?,?,?,?,?,?, ai_summary, ai_recommendation, COALESCE(ai_status,'pending'), ai_generated_at FROM (SELECT 1) LEFT JOIN reason_ai ON folder_number=?`, [...vals, d.folder_number]);
+  }
+}
+
+// Returns true ONLY for the one request that wins the lock
+export async function claimAiRun(folder: string): Promise<boolean> {
+  const sql = "UPDATE reason_ai SET ai_status='running' WHERE folder_number=? AND ai_summary IS NULL AND ai_status IN ('pending','failed')";
+  if (engineMode === "mysql" && mysqlPool) {
+    const [r]: any = await mysqlPool.query(sql, [folder]);
+    return r.affectedRows === 1;
+  }
+  return sqliteRun(sql, [folder]).changes === 1;
+}
+
+export async function saveAiResult(folder: string, summary: string, rec: string) {
+  const sql = `UPDATE reason_ai SET ai_summary=?, ai_recommendation=?, ai_status='done', ai_generated_at=${engineMode === "mysql" ? "NOW()" : "CURRENT_TIMESTAMP"} WHERE folder_number=?`;
+  if (engineMode === "mysql" && mysqlPool) await mysqlPool.query(sql, [summary, rec, folder]);
+  else sqliteRun(sql, [summary, rec, folder]);
+}
+
+export async function markAiFailed(folder: string) {
+  const sql = "UPDATE reason_ai SET ai_status='failed' WHERE folder_number=?";
+  if (engineMode === "mysql" && mysqlPool) await mysqlPool.query(sql, [folder]);
+  else sqliteRun(sql, [folder]);
+}

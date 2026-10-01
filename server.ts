@@ -939,6 +939,46 @@ async function startServer() {
     }
   });
 
+  // Save the reason/debrief data. Does NOT call AI.
+app.post("/api/reason/save", async (req, res) => {
+  try {
+    const d = req.body || {};
+    const sum = Number(d.price_factor_pct) + Number(d.technical_factor_pct) + Number(d.past_performance_pct);
+    if (!d.folder_number) return res.status(400).json({ ok: false, error: "folder_number required" });
+    if (Math.abs(sum - 100) > 0.01) return res.status(400).json({ ok: false, error: "Percentages must total 100" });
+    await saveDebrief(d);
+    res.json({ ok: true });
+  } catch (e: any) { res.status(400).json({ ok: false, error: e?.message }); }
+});
+
+app.get("/api/reason/:folder", async (req, res) => {
+  res.json({ ok: true, data: await getReason(req.params.folder) });
+});
+
+// AI runs here, ONE time only
+app.post("/api/reason/:folder/generate", async (req, res) => {
+  const folder = req.params.folder;
+  try {
+    const row: any = await getReason(folder);
+    if (!row) return res.status(404).json({ ok: false, error: "Save the debrief first." });
+
+    if (row.ai_summary) // already done: return saved text, ZERO tokens used
+      return res.json({ ok: true, cached: true, summary: row.ai_summary, recommendation: row.ai_recommendation });
+
+    if (!(await claimAiRun(folder)))  // someone else is running it
+      return res.status(409).json({ ok: false, error: "Already generating." });
+
+    try {
+      const out = await generateReasonAnalysis(row);
+      await saveAiResult(folder, out.summary, out.recommendation);
+      res.json({ ok: true, cached: false, ...out });
+    } catch (e: any) {
+      await markAiFailed(folder);   // allows a retry after a real failure
+      res.status(502).json({ ok: false, error: e?.message });
+    }
+  } catch (e: any) { res.status(400).json({ ok: false, error: e?.message }); }
+});
+
   // --------------------------------------------------------------------------
   // Vite Middleware (Dev) or Static Assets (Prod)
   // --------------------------------------------------------------------------
