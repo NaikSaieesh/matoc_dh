@@ -40,10 +40,32 @@ interface UserSession {
 }
 
 export default function App() {
-  const [user, setUser] = useState<UserSession | null>(null);
+    const [user, setUser] = useState<UserSession | null>(() => {
+    try {
+      const saved = sessionStorage.getItem("matoc_session_user");
+      if (!saved) return null;
+      const parsed = JSON.parse(saved);
+      if (!parsed?.user || !parsed?.expiresAt || Date.now() > parsed.expiresAt) {
+        sessionStorage.removeItem("matoc_session_user");
+        return null;
+      }
+      return parsed.user as UserSession;
+    } catch {
+      return null;
+    }
+  });
 
     // Start on the login page. The dashboard is only shown after a successful login.
-  const [view, setView] = useState<ViewState>({ page: "login" });
+    const [view, setView] = useState<ViewState>(() => {
+    try {
+      const saved = sessionStorage.getItem("matoc_session_user");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed?.user && Date.now() < parsed.expiresAt) return { page: "home" };
+      }
+    } catch {}
+    return { page: "login" };
+  });
 
   // Auth guard: if nobody is logged in, always show the login page
   useEffect(() => {
@@ -51,7 +73,7 @@ export default function App() {
       setView({ page: "login" });
     }
   }, [user, view.page]);
-  
+
   const [categories, setCategories] = useState<
     Array<{ key: string; label: string; desc: string; count: number }>
   >([
