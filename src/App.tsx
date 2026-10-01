@@ -305,7 +305,6 @@ export default function App() {
                   MATOC INTEL LOGIN
                 </h1>
                 <p className="text-xs text-slate-500 mt-1">
-                  Sign in with your account or Admin password (default: <code>Admin@123</code>)
                 </p>
               </div>
 
